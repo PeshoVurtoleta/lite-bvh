@@ -270,10 +270,11 @@ A tree holding `N` leaves uses at most `2N - 1` total nodes (when fully populate
 
 | Method | Returns | Description |
 |---|---|---|
-| `insertLeaf(leafAABB, data)` | `number` (node id) | Inserts a leaf. **Store the returned id.** Throws when `nodeCount === maxNodes`. |
-| `removeLeaf(leaf)` | `void` | Removes a leaf, heals the gap, returns nodes to the free list. |
-| `updateLeaf(leaf, newAABB, margin)` | `number` (node id) | Fast path: returns `leaf` unchanged if still contained. Slow path: removes, fattens by `margin`, re-inserts; returns a (possibly new) id. **Always reassign your stored handle from the return value.** |
-| `query(queryAABB, outBuffer)` | `number` (hit count) | Writes intersecting leaves' `userData` into `outBuffer`. Stops early when the buffer fills. |
+| `insertLeaf(leafAABB, data)` | `number` (node id) | Inserts a leaf. **Store the returned id.** Throws at capacity — atomically, before any mutation, so the tree is left valid. |
+| `removeLeaf(leaf)` | `void` | Removes a leaf, heals the gap, returns nodes to the free list. **Throws** on an invalid, freed, or non-leaf (internal) handle. |
+| `updateLeaf(leaf, newAABB, margin)` | `number` (node id) | Fast path: returns `leaf` unchanged if still contained. Slow path: removes, fattens by `margin`, re-inserts; returns a (possibly new) id. **Throws** on an invalid/freed handle. **Always reassign your stored handle from the return value.** |
+| `query(queryAABB, outBuffer)` | `number` (hit count) | Writes intersecting leaves' `userData` into `outBuffer`. Stops early when the buffer fills; a zero-length buffer returns `0`. |
+| `validate()` | `true` | **Debug/test only, O(n).** Throws naming the first offending node if the tree is inconsistent. Never call it on a hot path. |
 
 ### Conventions
 
@@ -303,8 +304,10 @@ A `DynamicBVH2D(4096)` is therefore **~160 KB** of backing buffers, comfortably 
 
 ## Edge cases & guarantees
 
-- **Capacity exhaustion throws synchronously** at `insertLeaf` — at the *boundary*, never partway through. The tree is left in a valid state.
-- **`updateLeaf`'s fast path is truly O(1).** Four typed-array reads and four `<=/>=` comparisons. Nothing else.
+- **Capacity exhaustion throws synchronously** at `insertLeaf` — at the *boundary*, never partway through. Capacity is reserved before the first write, so the tree is left byte-unchanged and still valid; keep using it.
+- **Handles are validated, fail-closed.** `removeLeaf` and `updateLeaf` throw on a handle that is out of range, non-integer, an internal node, or already freed — so a double-remove or a stale id can never silently corrupt the tree. The check is O(1) (a range test and one array read); it does not walk the tree.
+- **`updateLeaf`'s fast path is O(1).** The handle check (a range test + one `children` read), then four `bboxes` reads and four `<=/>=` comparisons. No allocation — gated by the torture suite at `maxArrayBuffersGrowth: 0`.
+- **`validate()` is available for tests and debugging.** It re-derives every structural invariant in O(n) and throws on the first violation. Not for hot paths.
 - **Removing the root** transitions the tree to empty cleanly (`root = -1`, `nodeCount = 0`).
 - **Removing one of two leaves** promotes the surviving sibling directly to the root, freeing the internal parent.
 - **`query` is reentrant-safe within a single thread** — the stack is per-instance state but each call reads it from `stackPtr = 0` to `stackPtr = 0`, so back-to-back queries don't interfere. Don't share an instance across Workers.

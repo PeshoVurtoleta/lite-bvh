@@ -85,6 +85,17 @@ export class DynamicBVH2D {
      * @returns Hit count. Read the prefix as `outBuffer.subarray(0, hitCount)`.
      */
     query(queryAABB: Float32Array, outBuffer: Int32Array): number;
+
+    /**
+     * Full structural self-check. **O(n); debug and test only -- never on a hot
+     * path.** Throws an `Error` naming the first offending node; returns `true`
+     * when the tree is internally consistent (free-list conservation, reciprocal
+     * links, correct heights, bbox containment, node markers, reachable count).
+     */
+    validate(): true;
+
+    /** True iff `id` is a currently-allocated leaf. O(1). Internal/test guard. */
+    _isLiveLeaf(id: number): boolean;
 }
 
 /** Package version. In three-place sync with `package.json` and `CHANGELOG.md`. */

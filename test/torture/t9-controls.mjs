@@ -47,4 +47,17 @@ export function run() {
     let diverges = false;
     for (let i = 0; i < correct.length; i++) if (correct[i] !== wrongOracle[i]) { diverges = true; break; }
     if (!diverges) die('T9 control: comparator failed to flag a wrong oracle');
+
+    // Control 4 -- validate() itself. Corrupt a reciprocal parent link and
+    // confirm validate() throws. If a broken tree validates, the gate is blind.
+    const t2 = new DynamicBVH2D(16);
+    t2.insertLeaf(setBox(new Float32Array(4), 0, 0, 1, 1), 0);
+    t2.insertLeaf(setBox(new Float32Array(4), 5, 5, 6, 6), 1);
+    t2.validate(); // healthy first
+    const root = t2.root;
+    const leftChild = t2.children[root << 1];
+    t2.parents[leftChild] = leftChild; // sever the reciprocal link
+    let caught = false;
+    try { t2.validate(); } catch { caught = true; }
+    if (!caught) die('T9 control: validate() passed a tree with a broken parent link');
 }

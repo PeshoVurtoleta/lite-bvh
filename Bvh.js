@@ -21,6 +21,23 @@
  * @author Zahary Shinikchiev
  */
 
+/**
+ * `children[id<<1]` doubles as a tri-state liveness marker, which is what makes
+ * O(1) handle validation possible without a traversal:
+ *   -1  -> a live LEAF (both child slots -1, set by _allocateNode)
+ *  >=0  -> an INTERNAL node (a real left child)
+ *   -2  -> a FREED slot (set by _freeNode; also the initial fill)
+ * So `children[id<<1] === -1` is true for exactly the live leaves.
+ */
+const FREED = -2;
+
+/**
+ * Upper bound on `maxNodes`. Node fields are addressed by `id << 2` (bboxes),
+ * so ids must stay well inside the positive int32 range; 2^26 nodes is already
+ * ~1 GB of bboxes and far below that limit. Anything larger is a caller error.
+ */
+const MAX_NODES = 1 << 26;
+
 export class DynamicBVH2D {
     /** Maximum number of nodes (leaves + internal). Set at construction. */
     maxNodes;
@@ -61,11 +78,20 @@ export class DynamicBVH2D {
      *   so size accordingly. Typical: `maxNodes = 4 * expectedEntities`.
      */
     constructor(maxNodes) {
+        // B-09: fail closed on a bad capacity with a library error, not a raw
+        // RangeError from a typed-array allocator three lines down. Note a
+        // two-leaf tree needs at least 3 nodes (2 leaves + 1 internal parent).
+        if (!Number.isInteger(maxNodes) || maxNodes < 1 || maxNodes > MAX_NODES) {
+            throw new Error(
+                'lite-bvh: maxNodes must be an integer in [1, ' + MAX_NODES + '], got ' + maxNodes);
+        }
         this.maxNodes = maxNodes;
 
         this.bboxes   = new Float32Array(maxNodes * 4);
         this.parents  = new Int32Array(maxNodes).fill(-1);
-        this.children = new Int32Array(maxNodes * 2).fill(-1);
+        // Every node starts FREED (-2). _allocateNode flips a slot's left child
+        // to -1 (live leaf); insertLeaf gives internal nodes real children.
+        this.children = new Int32Array(maxNodes * 2).fill(FREED);
         this.heights  = new Int32Array(maxNodes);
         this.userData = new Int32Array(maxNodes).fill(-1);
 
@@ -102,9 +128,21 @@ export class DynamicBVH2D {
 
     /** Internal O(1) deallocation back to the free-list. */
     _freeNode(nodeId) {
+        // Mark the slot FREED so a stale handle to it fails validation instead
+        // of masquerading as a live leaf (B-04/B-06). _allocateNode resets it.
+        this.children[nodeId << 1] = FREED;
         this.nextFree[nodeId] = this.freeHead;
         this.freeHead = nodeId;
         this.nodeCount--;
+    }
+
+    /**
+     * True iff `id` is a currently-allocated leaf. O(1); the guard behind every
+     * handle. `(id >>> 0) === id` rejects negatives, non-integers (e.g. 1.5) and
+     * ids >= 2^32 in one test before the range and leaf-marker checks.
+     */
+    _isLiveLeaf(id) {
+        return (id >>> 0) === id && id < this.maxNodes && this.children[id << 1] === -1;
     }
 
     /**
@@ -119,6 +157,20 @@ export class DynamicBVH2D {
      *   or `removeLeaf` later.
      */
     insertLeaf(leafAABB, data) {
+        // B-01: reserve capacity atomically, BEFORE the first mutation. A
+        // non-empty tree needs two free nodes (the leaf plus a new internal
+        // parent); an empty tree needs one. Checking up front means a capacity
+        // failure throws at the boundary and leaves the tree byte-unchanged and
+        // still valid -- as the README promises -- instead of consuming the leaf
+        // and then throwing on the parent, orphaning a node forever.
+        if (this.root === -1) {
+            if (this.freeHead === -1) {
+                throw new Error('lite-bvh: Max node capacity reached');
+            }
+        } else if (this.freeHead === -1 || this.nextFree[this.freeHead] === -1) {
+            throw new Error('lite-bvh: Max node capacity reached');
+        }
+
         const leaf = this._allocateNode();
 
         const bIdx = leaf << 2;
@@ -241,8 +293,10 @@ export class DynamicBVH2D {
                 const left = this.children[cIdx];
 
                 if (left === -1) {
-                    outBuffer[hitCount++] = this.userData[nodeId];
+                    // B-02: check BEFORE the write so a full -- or zero-length --
+                    // buffer never records a phantom hit and never reports one.
                     if (hitCount >= maxHits) break;
+                    outBuffer[hitCount++] = this.userData[nodeId];
                 } else {
                     // Safety: auto-grow the stack on pathologically deep trees.
                     if (stackPtr + 2 > stack.length) {
@@ -268,6 +322,15 @@ export class DynamicBVH2D {
      * @param {number} leaf Node id returned from a previous `insertLeaf`.
      */
     removeLeaf(leaf) {
+        // B-04/B-05: reject anything that is not a live leaf -- non-integer,
+        // negative, out of range, an internal node, or an already-freed slot --
+        // before touching the tree. Inlined `_isLiveLeaf`: `(leaf >>> 0) !== leaf`
+        // folds every non-uint32 into the reject path, so `children[leaf << 1]`
+        // is only read for an in-range integer id.
+        if ((leaf >>> 0) !== leaf || leaf >= this.maxNodes || this.children[leaf << 1] !== -1) {
+            throw new Error('lite-bvh: removeLeaf on an invalid or non-leaf handle: ' + leaf);
+        }
+
         if (leaf === this.root) {
             this.root = -1;
             this._freeNode(leaf);
@@ -320,6 +383,15 @@ export class DynamicBVH2D {
      * @returns {number} The active node id (possibly === `leaf`, possibly different).
      */
     updateLeaf(leaf, newAABB, margin) {
+        // B-06: reject an invalid, freed, or non-leaf handle up front so a stale
+        // id cannot resurrect a removed entity. This is the ONLY validation on
+        // the fast path: an integer/range test and one child-slot load (the
+        // tri-state leaf sentinel). No traversal, no allocation -- measured within
+        // noise of the pre-1.0.2 baseline (see decisions/0001-handle-validation.md).
+        if ((leaf >>> 0) !== leaf || leaf >= this.maxNodes || this.children[leaf << 1] !== -1) {
+            throw new Error('lite-bvh: updateLeaf on an invalid or non-leaf handle: ' + leaf);
+        }
+
         const b = leaf << 2;
 
         // Fast path: tight bounds still inside fat bounds.
@@ -390,6 +462,97 @@ export class DynamicBVH2D {
             index = this.parents[index];
         }
     }
+
+    /**
+     * Full structural self-check. **O(n); debug and test only -- never call it
+     * on a hot path.** Throws an `Error` naming the first offending node;
+     * returns `true` when the tree is internally consistent. Verifies:
+     *   - free-list conservation: `nodeCount + freeListLength === maxNodes`;
+     *   - the free-list is acyclic and in range;
+     *   - every parent/child link is reciprocal;
+     *   - `heights[n] === 1 + max(child heights)`;
+     *   - each internal node's bbox contains both children's bboxes;
+     *   - leaves have no children; internal nodes carry `userData === -1`;
+     *   - the number of reachable nodes equals `nodeCount`.
+     *
+     * @returns {true}
+     */
+    validate() {
+        const max = this.maxNodes;
+
+        // 1. Free-list: acyclic, in range, and conserving.
+        let free = 0;
+        for (let h = this.freeHead, guard = 0; h !== -1; h = this.nextFree[h], guard++) {
+            if (guard > max) throw new Error('lite-bvh: validate: free-list is cyclic');
+            if ((h >>> 0) >= max) throw new Error('lite-bvh: validate: free id out of range: ' + h);
+            free++;
+        }
+        if (this.nodeCount + free !== max) {
+            throw new Error('lite-bvh: validate: conservation violated: nodeCount ' +
+                this.nodeCount + ' + free ' + free + ' != maxNodes ' + max);
+        }
+
+        // 2. Empty tree.
+        if (this.root === -1) {
+            if (this.nodeCount !== 0) {
+                throw new Error('lite-bvh: validate: empty tree has nodeCount ' + this.nodeCount);
+            }
+            return true;
+        }
+        if ((this.root >>> 0) >= max) throw new Error('lite-bvh: validate: root out of range: ' + this.root);
+        if (this.parents[this.root] !== -1) throw new Error('lite-bvh: validate: root ' + this.root + ' has a parent');
+
+        // 3. DFS from the root: links, heights, bbox containment, node markers.
+        let reachable = 0;
+        const stack = [this.root];
+        while (stack.length) {
+            const n = stack.pop();
+            reachable++;
+            if (reachable > max) throw new Error('lite-bvh: validate: tree has a cycle');
+
+            const cIdx = n << 1;
+            const l = this.children[cIdx];
+            const r = this.children[cIdx + 1];
+
+            if (l === -1) {
+                // Leaf.
+                if (r !== -1) throw new Error('lite-bvh: validate: half-leaf node ' + n);
+                if (this.heights[n] !== 0) {
+                    throw new Error('lite-bvh: validate: leaf ' + n + ' has height ' + this.heights[n]);
+                }
+                continue;
+            }
+
+            // Internal node.
+            if ((l >>> 0) >= max || (r >>> 0) >= max) {
+                throw new Error('lite-bvh: validate: node ' + n + ' has an out-of-range child');
+            }
+            if (this.parents[l] !== n || this.parents[r] !== n) {
+                throw new Error('lite-bvh: validate: non-reciprocal parent link at node ' + n);
+            }
+            if (this.userData[n] !== -1) {
+                throw new Error('lite-bvh: validate: internal node ' + n + ' carries userData ' + this.userData[n]);
+            }
+            const expectH = 1 + Math.max(this.heights[l], this.heights[r]);
+            if (this.heights[n] !== expectH) {
+                throw new Error('lite-bvh: validate: node ' + n + ' height ' + this.heights[n] + ' != ' + expectH);
+            }
+            const nb = n << 2, lb = l << 2, rb = r << 2;
+            if (this.bboxes[nb]     > Math.min(this.bboxes[lb],     this.bboxes[rb]) ||
+                this.bboxes[nb + 1] > Math.min(this.bboxes[lb + 1], this.bboxes[rb + 1]) ||
+                this.bboxes[nb + 2] < Math.max(this.bboxes[lb + 2], this.bboxes[rb + 2]) ||
+                this.bboxes[nb + 3] < Math.max(this.bboxes[lb + 3], this.bboxes[rb + 3])) {
+                throw new Error('lite-bvh: validate: node ' + n + ' bbox does not contain its children');
+            }
+
+            stack.push(l, r);
+        }
+
+        if (reachable !== this.nodeCount) {
+            throw new Error('lite-bvh: validate: reachable ' + reachable + ' != nodeCount ' + this.nodeCount);
+        }
+        return true;
+    }
 }
 
 /**
@@ -397,4 +560,4 @@ export class DynamicBVH2D {
  * `version`, and the top entry of `CHANGELOG.md`. A release that touches one
  * without the other two is a broken release.
  */
-export const VERSION = '1.0.1';
+export const VERSION = '1.0.2';

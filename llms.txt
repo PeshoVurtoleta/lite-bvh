@@ -8,22 +8,30 @@ Single named export: `DynamicBVH2D`.
 
 ```ts
 class DynamicBVH2D {
-    constructor(maxNodes: number);            // ALLOCATES — call at setup
+    // ALLOCATES — call at setup. maxNodes must be an integer in [1, 2^26],
+    // else throws a library Error. A two-leaf tree needs at least 3 nodes.
+    constructor(maxNodes: number);
 
-    // O(log n) insert via SAH descent. Throws on capacity exhaustion.
+    // O(log n) insert via SAH descent. Throws on capacity exhaustion —
+    // atomically, before any mutation, so the tree stays valid.
     insertLeaf(leafAABB: Float32Array, data: number): number;       // returns node id
 
     // O(log n) remove. Heals the gap by promoting the sibling.
+    // THROWS on an invalid, freed, or non-leaf (internal) handle.
     removeLeaf(leaf: number): void;
 
     // O(1) fast path when newAABB still contained inside fat bounds.
     // O(log n) slow path: remove, fatten by margin, re-insert.
-    // ALWAYS reassign your stored id from the return value.
+    // THROWS on an invalid/freed handle. ALWAYS reassign your stored id.
     updateLeaf(leaf: number, newAABB: Float32Array, margin: number): number;
 
     // Iterative AABB-overlap query. Writes leaves' userData into outBuffer.
-    // Stops early when outBuffer fills.
+    // Stops early when outBuffer fills; a zero-length buffer returns 0.
     query(queryAABB: Float32Array, outBuffer: Int32Array): number;  // returns hit count
+
+    // Debug/test only, O(n). Throws naming the first bad node, else returns
+    // true. NEVER call on a hot path.
+    validate(): true;
 
     // Read-only stats
     readonly maxNodes: number;
