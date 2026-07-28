@@ -1,0 +1,88 @@
+# @zakkster/lite-bvh
+
+> Zero-GC dynamic Bounding Volume Hierarchy for 2D. Flat Structure-of-Arrays layout, O(1) free-list allocation, Surface Area Heuristic insertion, iterative query that writes hits into a caller-provided `Int32Array`. **No allocations after construction.** Companion to `@zakkster/lite-aabb` (same leaf-AABB format).
+
+## API
+
+Single named export: `DynamicBVH2D`.
+
+```ts
+class DynamicBVH2D {
+    constructor(maxNodes: number);            // ALLOCATES — call at setup
+
+    // O(log n) insert via SAH descent. Throws on capacity exhaustion.
+    insertLeaf(leafAABB: Float32Array, data: number): number;       // returns node id
+
+    // O(log n) remove. Heals the gap by promoting the sibling.
+    removeLeaf(leaf: number): void;
+
+    // O(1) fast path when newAABB still contained inside fat bounds.
+    // O(log n) slow path: remove, fatten by margin, re-insert.
+    // ALWAYS reassign your stored id from the return value.
+    updateLeaf(leaf: number, newAABB: Float32Array, margin: number): number;
+
+    // Iterative AABB-overlap query. Writes leaves' userData into outBuffer.
+    // Stops early when outBuffer fills.
+    query(queryAABB: Float32Array, outBuffer: Int32Array): number;  // returns hit count
+
+    // Read-only stats
+    readonly maxNodes: number;
+    readonly nodeCount: number;
+    readonly root: number;       // -1 if empty
+}
+```
+
+## Format
+
+- **AABB:** `Float32Array(4)` = `[minX, minY, maxX, maxY]`. Identical to `@zakkster/lite-aabb`.
+- **`userData`:** any `int32` you want returned from `query()` — typically an ECS entity id.
+- **`outBuffer`:** caller-owned `Int32Array`; size for your worst-case query batch.
+
+## The margin parameter
+
+Leaves are stored with **fat** bounds — the entity's bounds inflated by `margin` on every side. As long as the entity's tight bounds stay inside the fat bounds, `updateLeaf` takes the O(1) fast path. When they breach, the leaf is removed, refattened, and re-inserted.
+
+- **Sweet spot:** `margin ≈ expected_velocity × 2 frames` in world units.
+- **Too small:** every move triggers re-insert.
+- **Too large:** queries return more false positives.
+
+## Sizing
+
+- Each node is **40 bytes** across all SoA buffers.
+- For N leaves you need at most 2N-1 nodes; allocate `maxNodes ≈ 4 × expectedEntities` for headroom.
+- A `DynamicBVH2D(4096)` is ~160 KB.
+
+## When to use
+
+- 2D broadphase for collision detection, viewport culling, mouse picking.
+- Spatial queries for AOE effects, vision cones, explosion radii.
+- Twitch Extension overlays (under the 1 MB bundle and 60 fps budgets).
+- Any 2D scene with thousands of moving entities where O(N) scans are too slow.
+
+## When not to use
+
+- 3D scenes — this is 2D only.
+- Static-only data (no moves/inserts after build) — a flat sorted-by-Morton array can be faster.
+- Sub-million-unit world spans — `Float32` precision becomes limiting.
+- Workloads dominated by raycasts — not implemented yet (see roadmap).
+
+## Algorithm
+
+Box2D `b2_dynamicTree` ported to flat typed arrays:
+- Insert: Surface Area Heuristic descent picks the cheapest sibling.
+- Refit: walk parent chain, merge child bboxes into parent bbox.
+- No rotation rebalancing yet — SAH descent alone produces balanced trees for typical game workloads.
+
+## Install
+
+```bash
+npm i @zakkster/lite-bvh
+```
+
+```js
+import { DynamicBVH2D } from '@zakkster/lite-bvh';
+```
+
+## License
+
+MIT
