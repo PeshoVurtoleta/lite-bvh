@@ -7,6 +7,13 @@
  * `@zakkster/lite-aabb`.
  */
 
+/**
+ * On the SoA buffers below, `readonly` means **"do not reassign the binding"**
+ * -- the tree owns and reuses these arrays for the life of the instance. It does
+ * NOT mean the contents are immutable: every `insertLeaf`/`removeLeaf`/
+ * `updateLeaf`/`query` writes through them in place. Treat them as read-only
+ * views for introspection; never swap them out.
+ */
 export class DynamicBVH2D {
     /** Hard cap on total nodes (leaves + internal). */
     readonly maxNodes: number;
@@ -22,10 +29,23 @@ export class DynamicBVH2D {
     /** Int32Array(maxNodes) — user data per leaf (e.g. ECS entity id). */
     readonly userData: Int32Array;
 
+    /** Int32Array(maxNodes) -- free-list chain: `nextFree[id]` is the next free node id, or -1. */
+    readonly nextFree: Int32Array;
+    /** Head of the free-list chain, or -1 when the tree is full. */
+    readonly freeHead: number;
+
     /** Currently allocated node count (leaves + internal). Read-only stat. */
     readonly nodeCount: number;
     /** Root node id, or -1 if the tree is empty. */
     readonly root: number;
+
+    /**
+     * Int32Array traversal stack reused across all `query()` calls. Grows on
+     * pathologically deep trees (see the zero-alloc caveat in the README).
+     */
+    readonly queryStack: Int32Array;
+    /** Float32Array(4) internal scratch box for `updateLeaf` re-insert fattening. Never exposed as a result. */
+    readonly _scratchAABB: Float32Array;
 
     /**
      * @param maxNodes Hard cap on total nodes. For N leaves you create at most
@@ -66,3 +86,6 @@ export class DynamicBVH2D {
      */
     query(queryAABB: Float32Array, outBuffer: Int32Array): number;
 }
+
+/** Package version. In three-place sync with `package.json` and `CHANGELOG.md`. */
+export const VERSION: string;

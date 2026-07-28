@@ -391,3 +391,10 @@ export class DynamicBVH2D {
         }
     }
 }
+
+/**
+ * Package version. Kept in three-place sync: this constant, `package.json`
+ * `version`, and the top entry of `CHANGELOG.md`. A release that touches one
+ * without the other two is a broken release.
+ */
+export const VERSION = '1.0.1';
