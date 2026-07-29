@@ -56,6 +56,10 @@ export function run() {
         const x = px[idx], y = py[idx];
         setBox(q, x - 32, y - 32, x + 32, y + 32);
         tree.query(q, out);
+        // B4: the other two query kinds share `queryStack`, so gate them here too
+        // -- a per-hit allocation in either would show up as arrayBuffers growth.
+        tree.queryPoint(x, y, out);
+        tree.raycast(x - 48, y, x + 48, y, out);
         // Tight bounds stay inside the fat bounds -> updateLeaf fast path (O(1),
         // no remove/reinsert, no allocation).
         setBox(tight, x - 1, y - 1, x + 1, y + 1);
@@ -109,6 +113,10 @@ export function run() {
             const c = (i * 997) % M;
             setBox(q, c - 4000, -1, c + 4000, 11);
             adv.query(q, out);
+            // queryPoint / raycast on the deep adversarial tree: the shared stack
+            // must not grow for these either (B-08 + B-13).
+            adv.queryPoint(c, 5, out);
+            adv.raycast(c - 4000, 5, c + 4000, 5, out);
         };
 
         const advStackBefore = adv.queryStack.length;

@@ -130,6 +130,56 @@ export class DynamicBVH2D {
         return this.root === -1 ? 0 : (this.nodeCount + 1) >> 1;
     }
 
+    /**
+     * Empties the tree back to its just-constructed state WITHOUT reallocating
+     * any buffer -- for scene reloads and the torture soak tier (which would
+     * otherwise allocate a fresh tree per cycle). **O(maxNodes)**, so it is not
+     * a hot-path call.
+     *
+     * The load-bearing line is `children.fill(FREED)`: it fails closed. Every
+     * slot's liveness marker is reset to FREED so any leaf handle held across a
+     * `clear()` now fails `_isLiveLeaf` -- `updateLeaf`/`removeLeaf`/`getBounds`
+     * on a stale id throw instead of mutating a slot the caller no longer owns.
+     * Skipping it would leave the old leaves' `children[id<<1] === -1` markers
+     * intact, so a pre-clear handle would masquerade as live and corrupt the
+     * fresh tree. The other SoA fields (bboxes/heights/userData/parents) are
+     * reset per node by `_allocateNode` on reuse, so they need no wipe here.
+     */
+    clear() {
+        this.children.fill(FREED);
+        for (let i = 0; i < this.maxNodes - 1; i++) {
+            this.nextFree[i] = i + 1;
+        }
+        this.nextFree[this.maxNodes - 1] = -1;
+        this.freeHead = 0;
+        this.nodeCount = 0;
+        this.root = -1;
+    }
+
+    /**
+     * Reads a leaf's stored FAT bounds into a caller-owned length-4 buffer and
+     * returns it -- the supported alternative to indexing the raw `bboxes` view.
+     * O(1). The values are exactly what is stored (f32), i.e. the fattened box
+     * from the last insert/re-insert, not the caller's original tight box.
+     *
+     * @param {number} leaf Live-leaf node id from `insertLeaf`/`updateLeaf`.
+     * @param {Float32Array} out4 Length-4 destination, written `[minX,minY,maxX,maxY]`.
+     * @returns {Float32Array} `out4`.
+     * @throws On an invalid, freed, or non-leaf (internal) handle -- fail closed,
+     *   like the other handle-taking methods.
+     */
+    getBounds(leaf, out4) {
+        if ((leaf >>> 0) !== leaf || leaf >= this.maxNodes || this.children[leaf << 1] !== -1) {
+            throw new Error('lite-bvh: getBounds on an invalid or non-leaf handle: ' + leaf);
+        }
+        const b = leaf << 2;
+        out4[0] = this.bboxes[b];
+        out4[1] = this.bboxes[b + 1];
+        out4[2] = this.bboxes[b + 2];
+        out4[3] = this.bboxes[b + 3];
+        return out4;
+    }
+
     /** Internal O(1) allocation from the free-list. */
     _allocateNode() {
         if (this.freeHead === -1) {
@@ -386,6 +436,182 @@ export class DynamicBVH2D {
                             'call validate()');
                     }
 
+                    stack[stackPtr++] = left;
+                    stack[stackPtr++] = this.children[cIdx + 1];
+                }
+            }
+        }
+
+        return hitCount;
+    }
+
+    /**
+     * Point-pick query -- every leaf whose fat bounds contain `(x, y)`. The
+     * picking shortcut: no AABB to build for a mouse/touch hit-test. Identical
+     * in every other respect to `query` -- iterative, zero-allocation, writes
+     * `userData` into `outBuffer`, stops early when it fills, same touching-edge
+     * convention (a point on a boundary counts, `<=`/`>=`), same fail-closed
+     * stack (it REUSES `queryStack`, so it inherits B3's no-grow policy and is
+     * part of the T6 alloc gate).
+     *
+     * By construction this equals `query([x, y, x, y], outBuffer)`: containing a
+     * point is overlapping a zero-size box at that point. Non-finite `x`/`y`
+     * make every comparison false and return 0 -- no throw, matching `query`.
+     *
+     * @param {number} x
+     * @param {number} y
+     * @param {Int32Array} outBuffer Receives matching leaves' `userData`.
+     * @returns {number} Hit count; read `outBuffer.subarray(0, count)`.
+     * @throws Only on a traversal-stack overflow -- impossible for a well-formed
+     *   tree (see `query`); a fail-closed corruption signal, never an allocation.
+     */
+    queryPoint(x, y, outBuffer) {
+        if (this.root === -1) return 0;
+
+        let stackPtr = 0;
+        let hitCount = 0;
+        const stack = this.queryStack;
+        const maxHits = outBuffer.length;
+
+        stack[stackPtr++] = this.root;
+
+        while (stackPtr > 0) {
+            const nodeId = stack[--stackPtr];
+            const bIdx = nodeId << 2;
+
+            if (this.bboxes[bIdx] <= x && this.bboxes[bIdx + 2] >= x &&
+                this.bboxes[bIdx + 1] <= y && this.bboxes[bIdx + 3] >= y) {
+
+                const cIdx = nodeId << 1;
+                const left = this.children[cIdx];
+
+                if (left === -1) {
+                    if (hitCount >= maxHits) break;
+                    outBuffer[hitCount++] = this.userData[nodeId];
+                } else {
+                    if (stackPtr + 2 > stack.length) {
+                        throw new Error('lite-bvh: queryPoint stack overflow at depth ' +
+                            stackPtr + ' (stack ' + stack.length + ') -- tree is degenerate; ' +
+                            'call validate()');
+                    }
+                    stack[stackPtr++] = left;
+                    stack[stackPtr++] = this.children[cIdx + 1];
+                }
+            }
+        }
+
+        return hitCount;
+    }
+
+    /**
+     * Segment query -- every leaf whose fat bounds the segment `(p0x,p0y)`->
+     * `(p1x,p1y)` touches or crosses. A slab test clamped to the segment
+     * (`t` in `[0, 1]`), not an infinite ray. Iterative, zero-allocation, writes
+     * `userData` into `outBuffer`, stops early when it fills, REUSES `queryStack`
+     * (so it too is under the no-grow policy and the T6 gate).
+     *
+     * Descending only into node boxes the segment hits is complete: a parent box
+     * contains both children, so any segment reaching a leaf reaches every
+     * ancestor box first.
+     *
+     * **No callback form (by design).** A per-hit callback re-enters user code
+     * mid-traversal while `queryStack` is held; a nested query from that callback
+     * would corrupt the shared stack, turning reentrant-safety from true into
+     * silently-false. Hits go into a caller buffer like every other query here.
+     * See decisions/0004-query-kinds.md.
+     *
+     * A zero-length segment (`p0 === p1`) degenerates to `queryPoint(p0x, p0y)`.
+     * Non-finite endpoints return 0 hits, not a throw (read-only probe).
+     *
+     * @param {number} p0x
+     * @param {number} p0y
+     * @param {number} p1x
+     * @param {number} p1y
+     * @param {Int32Array} outBuffer Receives matching leaves' `userData`.
+     * @returns {number} Hit count; read `outBuffer.subarray(0, count)`.
+     * @throws Only on a traversal-stack overflow -- impossible for a well-formed
+     *   tree (see `query`); a fail-closed corruption signal, never an allocation.
+     */
+    raycast(p0x, p0y, p1x, p1y, outBuffer) {
+        if (this.root === -1) return 0;
+
+        // Read-only probe (matches `query`): a non-finite endpoint returns 0, not
+        // a throw. Guarded ONCE up front, not per node -- the slab arithmetic does
+        // not self-reject NaN the way `query`'s comparisons do (a NaN `t` leaves
+        // tmin=0/tmax=1 unclamped and would spuriously match every leaf), so the
+        // door has to be explicit. Off the per-hit path, so it costs the traversal
+        // nothing.
+        if (!(Number.isFinite(p0x) && Number.isFinite(p0y) &&
+              Number.isFinite(p1x) && Number.isFinite(p1y))) {
+            return 0;
+        }
+
+        const dx = p1x - p0x;
+        const dy = p1y - p0y;
+
+        // Explicit per-axis zero-direction handling rather than the branchless
+        // `1/d` slab trick: when the segment starts exactly on a slab boundary
+        // the reciprocal form computes `0/0 === NaN`, and a NaN silently defeats
+        // the tmin/tmax clamp (every `NaN <`/`NaN >` is false). Branches are free
+        // here (no allocation); NaN correctness is not. See decision 0004.
+        const invDx = dx !== 0 ? 1 / dx : 0;
+        const invDy = dy !== 0 ? 1 / dy : 0;
+
+        let stackPtr = 0;
+        let hitCount = 0;
+        const stack = this.queryStack;
+        const maxHits = outBuffer.length;
+
+        stack[stackPtr++] = this.root;
+
+        while (stackPtr > 0) {
+            const nodeId = stack[--stackPtr];
+            const b = nodeId << 2;
+
+            // Slab clip against this node's box over t in [0, 1].
+            let tmin = 0;
+            let tmax = 1;
+            let hit = true;
+
+            // X slabs.
+            if (dx !== 0) {
+                let t1 = (this.bboxes[b]     - p0x) * invDx;
+                let t2 = (this.bboxes[b + 2] - p0x) * invDx;
+                if (t1 > t2) { const tmp = t1; t1 = t2; t2 = tmp; }
+                if (t1 > tmin) tmin = t1;
+                if (t2 < tmax) tmax = t2;
+                if (tmin > tmax) hit = false;
+            } else if (p0x < this.bboxes[b] || p0x > this.bboxes[b + 2]) {
+                hit = false;
+            }
+
+            // Y slabs.
+            if (hit) {
+                if (dy !== 0) {
+                    let t1 = (this.bboxes[b + 1] - p0y) * invDy;
+                    let t2 = (this.bboxes[b + 3] - p0y) * invDy;
+                    if (t1 > t2) { const tmp = t1; t1 = t2; t2 = tmp; }
+                    if (t1 > tmin) tmin = t1;
+                    if (t2 < tmax) tmax = t2;
+                    if (tmin > tmax) hit = false;
+                } else if (p0y < this.bboxes[b + 1] || p0y > this.bboxes[b + 3]) {
+                    hit = false;
+                }
+            }
+
+            if (hit) {
+                const cIdx = nodeId << 1;
+                const left = this.children[cIdx];
+
+                if (left === -1) {
+                    if (hitCount >= maxHits) break;
+                    outBuffer[hitCount++] = this.userData[nodeId];
+                } else {
+                    if (stackPtr + 2 > stack.length) {
+                        throw new Error('lite-bvh: raycast stack overflow at depth ' +
+                            stackPtr + ' (stack ' + stack.length + ') -- tree is degenerate; ' +
+                            'call validate()');
+                    }
                     stack[stackPtr++] = left;
                     stack[stackPtr++] = this.children[cIdx + 1];
                 }
@@ -791,4 +1017,4 @@ export class DynamicBVH2D {
  * `version`, and the top entry of `CHANGELOG.md`. A release that touches one
  * without the other two is a broken release.
  */
-export const VERSION = '1.2.0';
+export const VERSION = '1.3.0';

@@ -69,7 +69,7 @@ It's what you'd write if you read Box2D's `b2_dynamicTree.cpp` and re-translated
 ### What this is *not*
 
 - **Not a physics engine.** No contact resolution, no impulses, no shape primitives beyond AABBs. Use this as the broadphase under your own physics.
-- **Not a raycaster.** Only AABB-overlap queries today. Raycast/segment queries are a clean addition (see [roadmap](#limitations--roadmap)).
+- **Not a nearest-neighbour index.** `query` (box), `queryPoint`, and `raycast` (segment) ship; `closestPoint` is deferred — it needs a priority queue with its own zero-alloc proof (see [roadmap](#limitations--roadmap)).
 - **Not a 3D BVH.** This is 2D only. The savings on each node (4 floats vs 6) are real for the use cases this is built for.
 
 ---
@@ -276,6 +276,10 @@ A tree holding `N` leaves uses at most `2N - 1` total nodes (when fully populate
 | `removeLeaf(leaf)` | `void` | Removes a leaf, heals the gap, returns nodes to the free list. **Throws** on an invalid, freed, or non-leaf (internal) handle. |
 | `updateLeaf(leaf, newAABB, margin)` | `number` (node id) | Fast path: returns `leaf` unchanged if still contained. Slow path: removes, fattens by `margin`, re-inserts; returns a (possibly new) id. **Throws** on an invalid/freed handle, or (slow path, atomically) when the fattened box is non-finite or inverted. **Always reassign your stored handle from the return value.** |
 | `query(queryAABB, outBuffer)` | `number` (hit count) | Writes intersecting leaves' `userData` into `outBuffer`. Stops early when the buffer fills; a zero-length buffer returns `0`. Read-only — takes no quarantine door, so a non-finite or empty-sentinel query box returns `0` rather than throwing. Never allocates (the fixed traversal stack throws fail-closed on the impossible overflow rather than growing). |
+| `queryPoint(x, y, outBuffer)` | `number` (hit count) | Leaves whose fat bounds contain `(x, y)`. Equals `query([x,y,x,y], out)` by construction — skips building an AABB for mouse/touch picking. Reuses the query stack (same no-grow policy); non-finite coords return `0`. |
+| `raycast(p0x, p0y, p1x, p1y, outBuffer)` | `number` (hit count) | Leaves a segment `p0→p1` touches or crosses (slab test over `t ∈ [0,1]`). **No callback** — it would re-enter user code while the shared stack is held; hits go into `outBuffer`. Zero-length segment ≡ `queryPoint(p0)`; a non-finite endpoint returns `0`. |
+| `clear()` | `void` | Reset to empty **without reallocating** any buffer (scene reloads, reset loops). O(maxNodes). Fails closed: a handle held across `clear()` throws afterwards. |
+| `getBounds(leaf, out4)` | `Float32Array` | Reads a leaf's stored fat bounds (f32-exact) into `out4` and returns it — the supported alternative to indexing raw `bboxes`. **Throws** on an invalid, freed, or internal handle. |
 | `validate()` | `true` | **Debug/test only, O(n).** Throws naming the first offending node if the tree is inconsistent. Never call it on a hot path. |
 
 ### Conventions
@@ -334,26 +338,29 @@ npm run verify   # both, in order
 | Construction | SoA sizes, free-list chain, initial state, `maxNodes` validation |
 | Insert | single leaf, internal parent creation, distinct ids, atomic capacity throw |
 | Query | empty tree, single leaf, miss, multiple hits, enclosing query, touching edges, early stop, zero-length buffer |
+| Query kinds | `queryPoint` ≡ degenerate box query; `raycast` hand-pinned (miss, start-inside, along-edge, zero-length) and ≡ `queryPoint` for a zero-length segment |
 | Remove | only leaf, sibling promotion, unfindability, capacity reusability |
 | Update | fast path (same id), slow path (new id), user-data preservation, margin correctness |
+| Clear & bounds | `clear()` reuses buffers, fails closed on stale handles, rebuilds identically; `getBounds` f32-exact round-trip |
 | Telemetry & rotations | `height`/`leafCount` accessors; monotone insert stays height-bounded |
-| Regressions | every S1/S2 finding (B-01…B-12, A-05) has a named before/after test |
+| Regressions | every S1/S2 finding (B-01…B-13, A-05) has a named before/after test |
 
-The **zero-allocation guarantee is not a heap-growth heuristic.** It is gated by the torture suite (tier T6) at `maxArrayBuffersGrowth: 0` with `stabilize: 'deep'`, plus a direct `queryStack.length` / `bboxes.buffer.byteLength` assertion — because the tree's buffers live in ArrayBuffer backing stores *outside* the V8 heap, where a heap-growth gate is blind. Tier T5 (differential fuzz against a brute-force O(N) oracle) proves rotations change the tree's shape but never its answers; tier T8 proves cross-package agreement with `@zakkster/lite-aabb`. `node --expose-gc test/torture.mjs` prints exactly `ok`.
+The **zero-allocation guarantee is not a heap-growth heuristic.** It is gated by the torture suite (tier T6) at `maxArrayBuffersGrowth: 0` with `stabilize: 'deep'`, plus a direct `queryStack.length` / `bboxes.buffer.byteLength` assertion — because the tree's buffers live in ArrayBuffer backing stores *outside* the V8 heap, where a heap-growth gate is blind. T6 gates all three query kinds (`query`, `queryPoint`, `raycast`), which share the one fixed stack. Tier T5 (differential fuzz against a brute-force O(N) oracle) fuzzes all three kinds against independent oracles — proving rotations change the tree's shape but never its answers; tier T8 proves cross-package agreement with `@zakkster/lite-aabb`. `node --expose-gc test/torture.mjs` prints exactly `ok`.
 
 ---
 
 ## Limitations & roadmap
 
-This is a v1 release. Planned additions, in rough order:
+`queryPoint` and `raycast` shipped in v1.3.0, alongside `clear()` and `getBounds()`. What's left:
 
-| Feature | Why | Difficulty |
+| Feature | Why | Status |
 |---|---|---|
-| **`raycast(p0, p1, callback)`** | Returns hits along a segment in near-order. Common need for vision/laser/projectile checks. | Medium |
-| **`queryPoint(x, y, outBuffer)`** | Specialized fast path for picking — saves the AABB construction. | Easy |
-| **`closestPoint(p, outBuffer)`** | Nearest-leaf to a point with optional max-distance cap. | Hard |
+| **`closestPoint(p, outBuffer)`** | Nearest-leaf to a point with optional max-distance cap. | **Deferred** — needs a best-first traversal ordered by distance, i.e. a priority queue: a second data structure with its own zero-allocation proof (a pre-allocated binary heap). Shipping it means allocating per query or proving a heap zero-alloc; that is its own session, not a footnote. See [decision 0004](decisions/0004-query-kinds.md). |
+| **Packed batch ops** (`insertLeaves`, packed `4×N` feed) | Broadphase feeding without a per-box view. | Planned for the twin 2.0.0 format contract (shared with `@zakkster/lite-aabb`). |
 
-PRs welcome. If you adopt this for a shipping product and have a feature on the list above, get in touch.
+> **Note on `raycast`.** It takes scalar endpoints and writes hits into a caller buffer — **not** the `raycast(p0, p1, callback)` form an earlier roadmap sketched. A per-hit callback re-enters user code mid-traversal while the shared query stack is held, so a nested query from that callback would corrupt it. Iterate the returned prefix instead.
+
+PRs welcome. If you adopt this for a shipping product and want `closestPoint`, get in touch.
 
 ---
 

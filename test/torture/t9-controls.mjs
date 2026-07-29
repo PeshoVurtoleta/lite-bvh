@@ -98,4 +98,40 @@ export function run() {
             'bound (' + noRot.height + ' <= ' + bound + ') -- the B3 height gate cannot fail');
     }
     noRot.validate(); // a tall tree is still structurally valid -- only unbalanced
+
+    // Control 7 -- the B4 clear() fail-closed guarantee. `clear()` resets the
+    // children markers to FREED so a leaf handle held across it fails
+    // `_isLiveLeaf`. Prove that step is load-bearing: a broken clear that rebuilds
+    // the free-list but SKIPS `children.fill(FREED)` leaves the stale handle
+    // looking live, and the real clear() must kill it.
+    const brk = new DynamicBVH2D(16);
+    const staleId = brk.insertLeaf(setBox(new Float32Array(4), 0, 0, 1, 1), 0);
+    brk.insertLeaf(setBox(new Float32Array(4), 5, 5, 6, 6), 1);
+    // Broken clear: everything clear() does EXCEPT resetting the child markers.
+    for (let i = 0; i < brk.maxNodes - 1; i++) brk.nextFree[i] = i + 1;
+    brk.nextFree[brk.maxNodes - 1] = -1;
+    brk.freeHead = 0; brk.nodeCount = 0; brk.root = -1;
+    if (!brk._isLiveLeaf(staleId)) {
+        die('T9 control: a clear() without children.fill already invalidated the handle -- ' +
+            'the fail-closed step would be decorative');
+    }
+    const cl = new DynamicBVH2D(16);
+    const stale2 = cl.insertLeaf(setBox(new Float32Array(4), 0, 0, 1, 1), 0);
+    cl.insertLeaf(setBox(new Float32Array(4), 5, 5, 6, 6), 1);
+    cl.clear();
+    if (cl._isLiveLeaf(stale2)) {
+        die('T9 control: clear() left a pre-clear handle live -- fail-closed guarantee broken');
+    }
+
+    // Control 8 -- the B4 touching-edge convention for queryPoint / raycast. Both
+    // must count a boundary contact as a hit (`<=`/`>=`), exactly like query().
+    // Assert a boundary point and an edge-grazing segment hit, and a just-outside
+    // twin misses -- so a future flip to strict `<` in either direction is caught.
+    const conv = new DynamicBVH2D(8);
+    conv.insertLeaf(setBox(new Float32Array(4), 0, 0, 10, 10), 7);
+    const o = new Int32Array(4);
+    if (conv.queryPoint(10, 5, o) !== 1) die('T9 control: queryPoint missed a boundary point (convention regressed)');
+    if (conv.queryPoint(10.01, 5, o) !== 0) die('T9 control: queryPoint hit a just-outside point (comparator blind)');
+    if (conv.raycast(0, -5, 0, 15, o) !== 1) die('T9 control: raycast missed an edge-grazing segment');
+    if (conv.raycast(-0.01, -5, -0.01, 15, o) !== 0) die('T9 control: raycast hit a just-outside segment (comparator blind)');
 }

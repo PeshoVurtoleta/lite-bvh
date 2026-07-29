@@ -35,6 +35,26 @@ class DynamicBVH2D {
     // to O(log n)); an impossible overflow throws fail-closed, never grows.
     query(queryAABB: Float32Array, outBuffer: Int32Array): number;  // returns hit count
 
+    // Point-pick query -- leaves whose fat bounds contain (x, y). Equals
+    // query([x,y,x,y], out) by construction; skips building an AABB for hit-tests.
+    // Reuses the query stack (same no-grow policy). Non-finite coords return 0.
+    queryPoint(x: number, y: number, outBuffer: Int32Array): number;  // returns hit count
+
+    // Segment query -- leaves a segment p0->p1 touches or crosses (slab test over
+    // t in [0,1]). NO callback (it would corrupt the shared stack mid-traversal);
+    // hits go into outBuffer. Zero-length segment == queryPoint(p0); non-finite
+    // endpoint returns 0. Reuses the query stack.
+    raycast(p0x: number, p0y: number, p1x: number, p1y: number,
+            outBuffer: Int32Array): number;  // returns hit count
+
+    // Reset to empty WITHOUT reallocating any buffer (scene reloads, reset loops).
+    // O(maxNodes). Fails closed: a handle held across clear() throws afterwards.
+    clear(): void;
+
+    // Read a leaf's stored fat bounds (f32-exact) into out4; returns out4. O(1).
+    // Throws on an invalid, freed, or internal handle.
+    getBounds(leaf: number, out4: Float32Array): Float32Array;
+
     // Debug/test only, O(n). Throws naming the first bad node (including a
     // non-finite or inverted bbox), else returns true. NEVER call on a hot path.
     validate(): true;
@@ -80,7 +100,8 @@ Leaves are stored with **fat** bounds — the entity's bounds inflated by `margi
 - 3D scenes — this is 2D only.
 - Static-only data (no moves/inserts after build) — a flat sorted-by-Morton array can be faster.
 - Sub-million-unit world spans — `Float32` precision becomes limiting.
-- Workloads dominated by raycasts — not implemented yet (see roadmap).
+- Nearest-neighbour queries — `closestPoint` is deferred (it needs a priority
+  queue with its own zero-alloc proof); `raycast`/`queryPoint` are shipped.
 
 ## Algorithm
 

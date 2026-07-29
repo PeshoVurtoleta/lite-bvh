@@ -41,7 +41,7 @@ function queryIds(tree, query, max = 1024) {
 // =============================================================================
 
 test('VERSION is exported and in three-place sync', () => {
-    assert.equal(VERSION, '1.2.0');
+    assert.equal(VERSION, '1.3.0');
 });
 
 // =============================================================================
@@ -381,6 +381,167 @@ test('rotations keep a monotone insert order shallow (B-07)', () => {
     assert.equal(tree.leafCount, N);
     assert.equal(tree.queryStack.length, 256, 'stack never grew');
     tree.validate();
+});
+
+// =============================================================================
+// QUERY KINDS (B4): clear / getBounds / queryPoint / raycast
+// =============================================================================
+
+/** Sorted userData from queryPoint. */
+function pointIds(tree, x, y, max = 1024) {
+    const out = new Int32Array(max);
+    const n = tree.queryPoint(x, y, out);
+    return Array.from(out.subarray(0, n)).sort((a, b) => a - b);
+}
+
+/** Sorted userData from raycast. */
+function rayIds(tree, p0x, p0y, p1x, p1y, max = 1024) {
+    const out = new Int32Array(max);
+    const n = tree.raycast(p0x, p0y, p1x, p1y, out);
+    return Array.from(out.subarray(0, n)).sort((a, b) => a - b);
+}
+
+test('clear() empties the tree without reallocating buffers', () => {
+    const tree = new DynamicBVH2D(64);
+    const bboxes = tree.bboxes, children = tree.children, nextFree = tree.nextFree;
+    for (let i = 0; i < 10; i++) tree.insertLeaf(box(i, 0, i + 1, 1), i);
+
+    tree.clear();
+
+    assert.equal(tree.root, -1);
+    assert.equal(tree.nodeCount, 0);
+    assert.equal(tree.height, -1);
+    assert.equal(tree.leafCount, 0);
+    assert.equal(tree.freeHead, 0);
+    // Same backing buffers -- clear() must not reallocate.
+    assert.equal(tree.bboxes, bboxes, 'bboxes reallocated');
+    assert.equal(tree.children, children, 'children reallocated');
+    assert.equal(tree.nextFree, nextFree, 'nextFree reallocated');
+    assert.equal(tree.query(box(-1, -1, 1000, 1000), new Int32Array(64)), 0);
+    tree.validate();
+});
+
+test('clear() then rebuild matches a fresh tree exactly', () => {
+    const build = (t) => { for (let i = 0; i < 30; i++) t.insertLeaf(box(i, i, i + 3, i + 3), i); };
+    const fresh = new DynamicBVH2D(128); build(fresh);
+    const reused = new DynamicBVH2D(128); build(reused); reused.clear(); build(reused);
+
+    const q = box(4, 4, 20, 20);
+    assert.deepEqual(queryIds(reused, q), queryIds(fresh, q));
+    assert.equal(reused.leafCount, fresh.leafCount);
+});
+
+test('clear() fails closed: a stale handle cannot mutate the fresh tree', () => {
+    const tree = new DynamicBVH2D(64);
+    const stale = tree.insertLeaf(box(0, 0, 10, 10), 1);
+    tree.clear();
+    // The pre-clear id must no longer look like a live leaf.
+    assert.throws(() => tree.updateLeaf(stale, box(0, 0, 1, 1), 0.1), /invalid or non-leaf/);
+    assert.throws(() => tree.removeLeaf(stale), /invalid or non-leaf/);
+    assert.throws(() => tree.getBounds(stale, new Float32Array(4)), /invalid or non-leaf/);
+});
+
+test('getBounds() reads a leaf\'s stored fat bounds, f32-exact', () => {
+    const tree = new DynamicBVH2D(16);
+    const leaf = tree.insertLeaf(box(0, 0, 10, 10), 1);
+    const moved = tree.updateLeaf(leaf, box(100, 100, 110, 110), 7);
+
+    const out = new Float32Array(4);
+    const ret = tree.getBounds(moved, out);
+    assert.equal(ret, out, 'returns the same buffer');
+    // Fat bounds = tight +/- margin, f32-exact (integers here, no rounding).
+    assert.deepEqual(Array.from(out), [93, 93, 117, 117]);
+});
+
+test('getBounds() throws on an invalid, freed, or internal handle', () => {
+    const tree = new DynamicBVH2D(16);
+    const a = tree.insertLeaf(box(0, 0, 10, 10), 1);
+    tree.insertLeaf(box(20, 20, 30, 30), 2);
+    const out = new Float32Array(4);
+    assert.throws(() => tree.getBounds(tree.root, out), /invalid or non-leaf/); // internal
+    assert.throws(() => tree.getBounds(-1, out), /invalid or non-leaf/);
+    assert.throws(() => tree.getBounds(1.5, out), /invalid or non-leaf/);
+    tree.removeLeaf(a);
+    assert.throws(() => tree.getBounds(a, out), /invalid or non-leaf/); // freed
+});
+
+test('queryPoint() equals query() of a degenerate box at the point', () => {
+    const tree = new DynamicBVH2D(128);
+    for (let i = 0; i < 20; i++) tree.insertLeaf(box(i * 5, 0, i * 5 + 8, 10), i);
+
+    for (const [x, y] of [[0, 0], [12, 5], [47, 5], [-3, 5], [100, 100], [8, 10]]) {
+        assert.deepEqual(
+            pointIds(tree, x, y),
+            queryIds(tree, box(x, y, x, y)),
+            `queryPoint(${x},${y}) != query(degenerate box)`,
+        );
+    }
+});
+
+test('queryPoint() counts a point on the boundary as a hit', () => {
+    const tree = new DynamicBVH2D(16);
+    tree.insertLeaf(box(0, 0, 10, 10), 1);
+    assert.deepEqual(pointIds(tree, 10, 5), [1], 'right edge counts');
+    assert.deepEqual(pointIds(tree, 0, 0), [1], 'corner counts');
+    assert.deepEqual(pointIds(tree, 10.0001, 5), [], 'just outside misses');
+});
+
+test('queryPoint() on empty tree and with NaN returns 0, no throw', () => {
+    const tree = new DynamicBVH2D(16);
+    assert.equal(tree.queryPoint(0, 0, new Int32Array(4)), 0);
+    tree.insertLeaf(box(0, 0, 10, 10), 1);
+    assert.equal(tree.queryPoint(NaN, 5, new Int32Array(4)), 0);
+    assert.equal(tree.queryPoint(5, NaN, new Int32Array(4)), 0);
+});
+
+test('raycast() hand-pinned cases', () => {
+    const tree = new DynamicBVH2D(16);
+    tree.insertLeaf(box(0, 0, 10, 10), 42); // one box
+
+    // Miss entirely (segment above the box).
+    assert.deepEqual(rayIds(tree, -5, 20, 15, 20), []);
+    // Horizontal crossing through the middle.
+    assert.deepEqual(rayIds(tree, -5, 5, 15, 5), [42]);
+    // Starts inside, points away.
+    assert.deepEqual(rayIds(tree, 5, 5, 50, 50), [42]);
+    // Exactly along the left edge (touching counts).
+    assert.deepEqual(rayIds(tree, 0, -5, 0, 15), [42]);
+    // Parallel to and just left of the left edge -> miss.
+    assert.deepEqual(rayIds(tree, -0.001, -5, -0.001, 15), []);
+    // Zero-length segment inside == a point hit.
+    assert.deepEqual(rayIds(tree, 5, 5, 5, 5), [42]);
+    // Zero-length segment outside == miss.
+    assert.deepEqual(rayIds(tree, 50, 50, 50, 50), []);
+    // Segment ends before reaching the box (t would need > 1).
+    assert.deepEqual(rayIds(tree, -10, 5, -5, 5), []);
+});
+
+test('raycast() zero-length segment equals queryPoint everywhere', () => {
+    const tree = new DynamicBVH2D(128);
+    for (let i = 0; i < 20; i++) tree.insertLeaf(box(i * 5, 0, i * 5 + 8, 10), i);
+    for (const [x, y] of [[0, 0], [12, 5], [47, 5], [-3, 5], [8, 10]]) {
+        assert.deepEqual(rayIds(tree, x, y, x, y), pointIds(tree, x, y),
+            `raycast zero-length != queryPoint at (${x},${y})`);
+    }
+});
+
+test('raycast() on empty tree and with non-finite endpoints returns 0', () => {
+    const tree = new DynamicBVH2D(16);
+    assert.equal(tree.raycast(0, 0, 1, 1, new Int32Array(4)), 0);
+    tree.insertLeaf(box(0, 0, 10, 10), 1);
+    assert.equal(tree.raycast(NaN, 0, 5, 5, new Int32Array(4)), 0);
+    assert.equal(tree.raycast(0, 0, Infinity, 5, new Int32Array(4)), 0);
+});
+
+test('queryPoint / raycast respect outBuffer capacity and stop early', () => {
+    const tree = new DynamicBVH2D(128);
+    for (let i = 0; i < 30; i++) tree.insertLeaf(box(0, 0, 10, 10), i); // all overlap
+    const small = new Int32Array(5);
+    assert.equal(tree.queryPoint(5, 5, small), 5, 'queryPoint stops when buffer fills');
+    assert.equal(tree.raycast(-1, 5, 11, 5, small), 5, 'raycast stops when buffer fills');
+    // Zero-length buffer records nothing.
+    assert.equal(tree.queryPoint(5, 5, new Int32Array(0)), 0);
+    assert.equal(tree.raycast(-1, 5, 11, 5, new Int32Array(0)), 0);
 });
 
 // =============================================================================

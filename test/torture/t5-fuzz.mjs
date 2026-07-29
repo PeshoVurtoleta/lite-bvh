@@ -6,6 +6,12 @@
  * query ops against the tree AND against a plain O(N) array-scan oracle, and
  * after every query assert the two produce the identical set of hits.
  *
+ * B4 widens the query op to all three kinds -- box `query`, `queryPoint`, and
+ * `raycast` -- each compared against its own brute-force scan (`overlaps`,
+ * `pointIn`, `segHitsBox`). queryPoint must equal a degenerate box query and
+ * raycast must equal the segment-vs-AABB oracle; a shared bug can't hide because
+ * the oracles are written independently of the tree's traversal.
+ *
  * Because the oracle is rotation-agnostic, "tree == oracle before and after
  * rebalancing" is exactly the guarantee the B3 brief asks for: the hit sets are
  * identical to a pre-rotation implementation across the whole corpus.
@@ -36,6 +42,42 @@ const VALIDATE_EVERY = 2000;
 /** Two AABBs overlap iff they touch or cross on both axes (matches query()). */
 function overlaps(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1) {
     return ax0 <= bx1 && ax1 >= bx0 && ay0 <= by1 && ay1 >= by0;
+}
+
+/** Point inside a box, boundary counted (matches queryPoint()). */
+function pointIn(x, y, bx0, by0, bx1, by1) {
+    return bx0 <= x && bx1 >= x && by0 <= y && by1 >= y;
+}
+
+/**
+ * Segment (p0->p1) touches or crosses a box over t in [0,1]. A line-for-line
+ * brute-force twin of the tree's slab test in `raycast`, including the explicit
+ * zero-direction branch -- so a divergence is a real bug, not a convention gap.
+ */
+function segHitsBox(p0x, p0y, p1x, p1y, bx0, by0, bx1, by1) {
+    const dx = p1x - p0x, dy = p1y - p0y;
+    let tmin = 0, tmax = 1;
+    if (dx !== 0) {
+        const inv = 1 / dx;
+        let t1 = (bx0 - p0x) * inv, t2 = (bx1 - p0x) * inv;
+        if (t1 > t2) { const t = t1; t1 = t2; t2 = t; }
+        if (t1 > tmin) tmin = t1;
+        if (t2 < tmax) tmax = t2;
+        if (tmin > tmax) return false;
+    } else if (p0x < bx0 || p0x > bx1) {
+        return false;
+    }
+    if (dy !== 0) {
+        const inv = 1 / dy;
+        let t1 = (by0 - p0y) * inv, t2 = (by1 - p0y) * inv;
+        if (t1 > t2) { const t = t1; t1 = t2; t2 = t; }
+        if (t1 > tmin) tmin = t1;
+        if (t2 < tmax) tmax = t2;
+        if (tmin > tmax) return false;
+    } else if (p0y < by0 || p0y > by1) {
+        return false;
+    }
+    return true;
 }
 
 export function run() {
@@ -95,26 +137,70 @@ export function run() {
             oslot[r] = id;
             mirror(r, id); // re-read: fast path keeps old fat box, slow path stores new fat box
         } else {
-            // QUERY: compare hit SETS (order-independent) against the oracle.
-            const qx = rnd(WORLD), qy = rnd(WORLD);
-            const qx1 = qx + rnd(200), qy1 = qy + rnd(200);
-            const n = tree.query(setBox(box, qx, qy, qx1, qy1), out);
-
+            // QUERY: compare hit SETS (order-independent) against the oracle. One
+            // roll picks among the three query kinds so all of box / point /
+            // segment are fuzzed against their own brute-force scan. B4 adds the
+            // point and segment kinds; each must match the oracle exactly.
+            const kind = rnd(3);
             const s = stamp++;
-            for (let i = 0; i < n; i++) seen[out[i]] = s;
+            let n = 0;
+            let describe;
 
-            let oracleHits = 0;
-            for (let i = 0; i < live; i++) {
-                if (overlaps(os0[i], ot0[i], os1[i], ot1[i], qx, qy, qx1, qy1)) {
-                    oracleHits++;
-                    check(seen[odata[i]] === s,
-                        () => `T5: op ${op} seed ${SEED}: leaf data ${odata[i]} overlaps query ` +
-                              `[${qx},${qy},${qx1},${qy1}] but the tree missed it (live=${live})`);
+            if (kind === 0) {
+                // Box query.
+                const qx = rnd(WORLD), qy = rnd(WORLD);
+                const qx1 = qx + rnd(200), qy1 = qy + rnd(200);
+                n = tree.query(setBox(box, qx, qy, qx1, qy1), out);
+                for (let i = 0; i < n; i++) seen[out[i]] = s;
+                describe = `box [${qx},${qy},${qx1},${qy1}]`;
+                let oracleHits = 0;
+                for (let i = 0; i < live; i++) {
+                    if (overlaps(os0[i], ot0[i], os1[i], ot1[i], qx, qy, qx1, qy1)) {
+                        oracleHits++;
+                        check(seen[odata[i]] === s, () =>
+                            `T5: op ${op} seed ${SEED}: leaf ${odata[i]} overlaps ${describe} ` +
+                            `but the tree missed it (live=${live})`);
+                    }
                 }
+                check(oracleHits === n, () =>
+                    `T5: op ${op} seed ${SEED}: ${describe} tree ${n} hits, oracle ${oracleHits}`);
+            } else if (kind === 1) {
+                // Point query.
+                const px = rnd(WORLD), py = rnd(WORLD);
+                n = tree.queryPoint(px, py, out);
+                for (let i = 0; i < n; i++) seen[out[i]] = s;
+                describe = `point (${px},${py})`;
+                let oracleHits = 0;
+                for (let i = 0; i < live; i++) {
+                    if (pointIn(px, py, os0[i], ot0[i], os1[i], ot1[i])) {
+                        oracleHits++;
+                        check(seen[odata[i]] === s, () =>
+                            `T5: op ${op} seed ${SEED}: leaf ${odata[i]} contains ${describe} ` +
+                            `but queryPoint missed it (live=${live})`);
+                    }
+                }
+                check(oracleHits === n, () =>
+                    `T5: op ${op} seed ${SEED}: ${describe} tree ${n} hits, oracle ${oracleHits}`);
+            } else {
+                // Segment query (raycast). Endpoints anywhere in the world, so
+                // segments start inside boxes, graze edges, and miss entirely.
+                const ax = rnd(WORLD), ay = rnd(WORLD);
+                const bx = rnd(WORLD), by = rnd(WORLD);
+                n = tree.raycast(ax, ay, bx, by, out);
+                for (let i = 0; i < n; i++) seen[out[i]] = s;
+                describe = `seg (${ax},${ay})->(${bx},${by})`;
+                let oracleHits = 0;
+                for (let i = 0; i < live; i++) {
+                    if (segHitsBox(ax, ay, bx, by, os0[i], ot0[i], os1[i], ot1[i])) {
+                        oracleHits++;
+                        check(seen[odata[i]] === s, () =>
+                            `T5: op ${op} seed ${SEED}: leaf ${odata[i]} on ${describe} ` +
+                            `but raycast missed it (live=${live})`);
+                    }
+                }
+                check(oracleHits === n, () =>
+                    `T5: op ${op} seed ${SEED}: ${describe} tree ${n} hits, oracle ${oracleHits}`);
             }
-            check(oracleHits === n,
-                () => `T5: op ${op} seed ${SEED}: tree returned ${n} hits, oracle found ${oracleHits} ` +
-                      `(a phantom or duplicate hit)`);
         }
 
         if (op % VALIDATE_EVERY === 0) {

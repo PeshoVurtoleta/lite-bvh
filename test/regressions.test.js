@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-bvh -- finding regressions (B1/B2/B3).
+ * @zakkster/lite-bvh -- finding regressions (B1/B2/B3/B4).
  *
  * One passing test per fixed finding, each named by its id, each ending in
  * `tree.validate()` so a fix that trades one corruption for another is caught:
@@ -7,8 +7,10 @@
  *   - B2 (v1.1.0): poison quarantine -- B-03/10/11/12, A-05.
  *   - B3 (v1.2.0): rotations + query-stack -- B-07 (height bound) and B-08 (query
  *     no longer allocates), plus the stale-refit-on-remove fix rotations exposed.
+ *   - B4 (v1.3.0): new query kinds -- B-13. clear/getBounds/queryPoint/raycast
+ *     ship, and queryPoint/raycast inherit B-08's no-grow query stack.
  *
- * See decisions/0001..0003 and CHANGELOG.md.
+ * See decisions/0001..0004 and CHANGELOG.md.
  */
 
 import { test } from 'node:test';
@@ -334,4 +336,69 @@ test('remove refits the healed grandparent (no stale height mid-drain)', () => {
     }
     assert.equal(tree.nodeCount, 0);
     assert.equal(tree.root, -1);
+});
+
+// -----------------------------------------------------------------------------
+// B-13 -- the promised query kinds ship, and the two hot ones (queryPoint,
+// raycast) inherit B-08's fixed no-grow stack: probing the adversarial tree
+// must not grow queryStack, exactly as query() must not.
+// -----------------------------------------------------------------------------
+test('B-13: queryPoint / raycast on an adversarial tree do not grow the stack', () => {
+    const N = 20000;
+    const tree = new DynamicBVH2D(4 * N + 8);
+    const probe = new Float32Array(4);
+    for (let i = 0; i < N; i++) {
+        probe[0] = i; probe[1] = 0; probe[2] = i + 100; probe[3] = 10;
+        tree.insertLeaf(probe, i);
+    }
+    const stackBefore = tree.queryStack.length;
+    assert.equal(stackBefore, 256);
+    const out = new Int32Array(N);
+
+    // A point inside the overlapping slab band, and a segment spanning the whole
+    // extent -- each visits deep into the (now balanced) tree.
+    tree.queryPoint(N >> 1, 5, out);
+    assert.equal(tree.queryStack.length, stackBefore, 'queryPoint grew the stack');
+    tree.raycast(-1e9, 5, 1e9, 5, out);
+    assert.equal(tree.queryStack.length, stackBefore, 'raycast grew the stack');
+    tree.validate();
+});
+
+// -----------------------------------------------------------------------------
+// B-13 -- clear() reuses the buffers, fails closed on stale handles, and leaves
+// a reusable tree whose rebuild is identical to a fresh one.
+// -----------------------------------------------------------------------------
+test('B-13: clear() reuses buffers, fails closed, and rebuilds identically', () => {
+    const N = 400;
+    const build = (t) => {
+        const ids = [];
+        for (let i = 0; i < N; i++) {
+            const x = (i * 37) % 4096, y = (i * 71) % 4096;
+            ids.push(t.insertLeaf(box(x, y, x + 3, y + 3), i));
+        }
+        return ids;
+    };
+    const full = box(-1e9, -1e9, 1e9, 1e9);
+    const hits = (t) => {
+        const out = new Int32Array(N);
+        const n = t.query(full, out);
+        return Array.from(out.subarray(0, n)).sort((a, b) => a - b);
+    };
+
+    const fresh = new DynamicBVH2D(4 * N + 8); build(fresh);
+
+    const reused = new DynamicBVH2D(4 * N + 8);
+    const bboxes = reused.bboxes, children = reused.children;
+    const staleIds = build(reused);
+    reused.clear();
+    reused.validate();
+    assert.equal(reused.bboxes, bboxes, 'clear reallocated bboxes');
+    assert.equal(reused.children, children, 'clear reallocated children');
+    // Fail closed: every pre-clear handle is dead.
+    for (const id of staleIds) {
+        assert.throws(() => reused.removeLeaf(id), /invalid or non-leaf handle/);
+    }
+    build(reused);
+    assert.deepEqual(hits(reused), hits(fresh), 'rebuild after clear diverged from fresh');
+    reused.validate();
 });

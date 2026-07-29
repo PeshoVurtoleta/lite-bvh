@@ -6,6 +6,12 @@
  * independent witness (lite-leak) tracks a per-cycle resource and must return to
  * size 0 -- so a free-list leak and a JS-object leak cannot hide behind each
  * other. Heap is sampled ACROSS cycles, not within one.
+ *
+ * The teardown alternates two drain paths (B4): odd cycles remove every leaf one
+ * by one, even cycles call `clear()`. Both must satisfy the same post-conditions,
+ * so `clear()`'s free-list rebuild is soaked 2048 times and any per-cycle growth
+ * it introduced (it reuses buffers, so there should be none) shows in the
+ * across-cycle heap sample.
  */
 
 import { DynamicBVH2D } from '../../Bvh.js';
@@ -43,8 +49,12 @@ export function run() {
         const live = tree.query(probe, out);
         check(live === N, () => `T7: cycle ${c} expected ${N} live, got ${live}`);
 
-        // Tear down.
-        for (let i = 0; i < N; i++) tree.removeLeaf(ids[i]);
+        // Tear down. Alternate the two drain paths so clear() is soaked too.
+        if (c & 1) {
+            for (let i = 0; i < N; i++) tree.removeLeaf(ids[i]);
+        } else {
+            tree.clear();
+        }
         tracker.untrack(h);
 
         check(tree.nodeCount === 0, () => `T7: cycle ${c} nodeCount ${tree.nodeCount} != 0`);

@@ -3,6 +3,42 @@
 All notable changes to `@zakkster/lite-bvh` are documented here.
 The format follows Keep a Changelog; this package adheres to SemVer.
 
+## [1.3.0] - 2026-07-29
+
+New query kinds, on the now-sound structure (B-13). Point-pick and segment
+queries join the box query; `clear()` and `getBounds()` round out introspection.
+`closestPoint` is deferred, with its reason on the record. See
+`decisions/0004-query-kinds.md`.
+
+### Added
+- **`queryPoint(x, y, out)`** -- every leaf whose fat bounds contain the point.
+  Equals `query([x, y, x, y], out)` by construction (a point is a zero-size box);
+  skips building an AABB for mouse/touch hit-tests.
+- **`raycast(p0x, p0y, p1x, p1y, out)`** -- every leaf a segment touches or
+  crosses (a slab test clamped to `t in [0, 1]`). **No callback form**: a per-hit
+  callback would re-enter user code mid-traversal while the shared query stack is
+  held, so a nested query would corrupt it; hits go into the caller buffer like
+  every other query here. A zero-length segment degenerates to `queryPoint`.
+- **`clear()`** -- reset to empty without reallocating any buffer, for scene
+  reloads and reset-in-place loops. O(maxNodes). Fails closed: a leaf handle held
+  across a `clear()` throws instead of mutating a slot the caller no longer owns.
+- **`getBounds(leaf, out4)`** -- read a leaf's stored fat bounds (f32-exact) into
+  a caller buffer, the supported alternative to indexing the raw `bboxes` view.
+- Torture coverage: T5 now fuzzes all three query kinds against independent
+  brute-force oracles; T6 gates `queryPoint`/`raycast` for allocation on both the
+  scattered and adversarial trees; T7 soaks `clear()`; T9 adds controls for the
+  `clear()` fail-closed step and the point/segment touching-edge convention.
+
+### Notes
+- `queryPoint` and `raycast` REUSE the query stack, so they inherit B3's no-grow /
+  fail-closed policy and are part of the `maxArrayBuffersGrowth: 0` gate.
+- The `query`/`updateLeaf` fast paths and the SAH insert are UNCHANGED (the new
+  methods add no instructions to them). Every new probe measures 0 bytes/op.
+- **`closestPoint` is deferred**, not shipped: nearest-leaf needs a priority queue
+  -- a second data structure with its own zero-allocation proof -- and bolting one
+  on to hit one method would allocate per query or ship an unproven heap. Recorded
+  in decision 0004 rather than half-shipped.
+
 ## [1.2.0] - 2026-07-29
 
 Tree rotations. An adversarial insert order can no longer degrade the tree into

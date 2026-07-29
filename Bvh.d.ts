@@ -84,6 +84,28 @@ export class DynamicBVH2D {
     insertLeaf(leafAABB: Float32Array, data: number): number;
 
     /**
+     * Empties the tree to its just-constructed state WITHOUT reallocating any
+     * buffer -- for scene reloads and reset-in-place loops. **O(maxNodes)**, not
+     * a hot-path call. Fails closed: every liveness marker is reset, so a leaf
+     * handle held across a `clear()` throws from `updateLeaf`/`removeLeaf`/
+     * `getBounds` instead of mutating a slot the caller no longer owns.
+     */
+    clear(): void;
+
+    /**
+     * Reads a leaf's stored FAT bounds into `out4` and returns it -- the
+     * supported alternative to indexing the raw `bboxes` view. O(1). The values
+     * are the fattened box from the last insert/re-insert (f32-exact), not the
+     * caller's original tight box.
+     *
+     * @param leaf Live-leaf node id.
+     * @param out4 Length-4 destination, written `[minX, minY, maxX, maxY]`.
+     * @returns `out4`.
+     * @throws On an invalid, freed, or non-leaf (internal) handle.
+     */
+    getBounds(leaf: number, out4: Float32Array): Float32Array;
+
+    /**
      * Removes a leaf, heals the gap by promoting its sibling, and returns the
      * nodes to the free-list. O(log n). Throws on an invalid, freed, or non-leaf
      * (internal) handle.
@@ -122,6 +144,37 @@ export class DynamicBVH2D {
      *   the stack inside the loop.
      */
     query(queryAABB: Float32Array, outBuffer: Int32Array): number;
+
+    /**
+     * Point-pick query -- every leaf whose fat bounds contain `(x, y)`. Equals
+     * `query([x, y, x, y], outBuffer)` by construction; skips building an AABB
+     * for mouse/touch hit-tests. Iterative, zero-allocation, writes `userData`
+     * into `outBuffer`, stops early when it fills, same touching-edge convention
+     * as `query`. REUSES the query stack (inherits the no-grow policy). Non-finite
+     * coordinates return 0, not a throw.
+     *
+     * @returns Hit count. Read `outBuffer.subarray(0, count)`.
+     * @throws Only on a traversal-stack overflow -- impossible for a well-formed
+     *   tree; fail-closed, never an allocation.
+     */
+    queryPoint(x: number, y: number, outBuffer: Int32Array): number;
+
+    /**
+     * Segment query -- every leaf whose fat bounds the segment `(p0x,p0y)`->
+     * `(p1x,p1y)` touches or crosses (a slab test clamped to `t in [0, 1]`, not
+     * an infinite ray). Iterative, zero-allocation, writes `userData` into
+     * `outBuffer`, stops early when it fills, REUSES the query stack.
+     *
+     * **No callback form by design**: a per-hit callback would re-enter user code
+     * mid-traversal while the shared stack is held, so a nested query would
+     * corrupt it. Hits go into the caller buffer instead. A zero-length segment
+     * degenerates to `queryPoint(p0x, p0y)`; a non-finite endpoint returns 0.
+     *
+     * @returns Hit count. Read `outBuffer.subarray(0, count)`.
+     * @throws Only on a traversal-stack overflow -- impossible for a well-formed
+     *   tree; fail-closed, never an allocation.
+     */
+    raycast(p0x: number, p0y: number, p1x: number, p1y: number, outBuffer: Int32Array): number;
 
     /**
      * Full structural self-check. **O(n); debug and test only -- never on a hot

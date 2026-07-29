@@ -16,8 +16,10 @@
  *     T9  controls (must be able to fail)
  *
  * T2 (aliasing) is reserved for a later session and intentionally not registered
- * here. T5 is wired as of B3 (rotations must not change query answers); T8 as of
- * B2 (poison quarantine).
+ * here. T5 is wired as of B3 (rotations must not change query answers) and widened
+ * in B4 to fuzz all three query kinds (box / point / segment) against independent
+ * oracles; T6/T7/T9 gained B4 coverage (queryPoint + raycast alloc, clear() soak,
+ * clear() fail-closed + touching-edge controls); T8 as of B2 (poison quarantine).
  *
  * lite-gc-profiler is one-measurement-at-a-time, so tiers run STRICTLY
  * SEQUENTIALLY -- never nested, never concurrent.
