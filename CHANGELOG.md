@@ -3,6 +3,65 @@
 All notable changes to `@zakkster/lite-bvh` are documented here.
 The format follows Keep a Changelog; this package adheres to SemVer.
 
+## [1.1.0] - 2026-07-29
+
+Poison quarantine. A degenerate box can no longer enter the tree and silently
+kill it. The entry door rejects what `@zakkster/lite-aabb`'s degenerate-value
+law (1.1.0) defines as invalid, and `validate()` is the backstop if poison ever
+arrives another way. See `decisions/0002-poison-quarantine.md`.
+
+### Fixed
+- **B-03** one NaN leaf no longer kills the whole tree. A non-finite bound
+  propagated through `_refit` to the root, after which every query returned 0
+  hits, permanently and silently. `insertLeaf` now rejects a non-finite or
+  inverted box at the door, before any mutation -- atomically, so the tree is
+  byte-unchanged on a rejected insert.
+- **B-10** `userData` must be a non-negative int32. `-1` (the internal-node
+  sentinel), `2**31` (which wrapped negative in the `Int32Array`), `3.7` (which
+  truncated to `3`), and `NaN` were all accepted silently; each now throws.
+- **A-05 at the door** a negative `margin` larger than half the box width
+  inverts the fattened box; `updateLeaf`'s slow path now validates the fattened
+  box BEFORE removing the leaf, so an inverting margin throws atomically (the
+  leaf stays live) instead of storing an inverted box.
+
+### Added
+- The quarantine predicate `_isValidBox` -- all four bounds finite AND
+  `minX <= maxX && minY <= maxY`. Copied inline from `@zakkster/lite-aabb`'s
+  `isValid` (1.1.0), BY CONTRACT: lite-bvh takes no runtime dependency on
+  lite-aabb; the two packages agree on "broken box" by a shared definition, not
+  a dependency edge.
+- `validate()` now detects a non-finite or inverted bbox on any reachable node
+  and names the offender. The old containment check was NaN-blind
+  (`NaN > NaN` is `false`), so a poisoned node slipped past it.
+- Torture tier **T8 (cross-package)**: builds boxes with `@zakkster/lite-aabb`
+  (a new TEST-ONLY devDep), feeds a `merge`/`extend`-poisoned box into a live
+  tree, and asserts the door holds and the tree survives byte-identical. T4
+  gains the input-quarantine block (short/oversized buffers, non-`Float32Array`
+  boxes, bad `userData`, bboxes aliasing); T1 crosses every degenerate value as
+  a leaf; T9 gains a control proving `validate()`'s poison detector can fail.
+
+### Changed
+- `insertLeaf` and `updateLeaf` now THROW on a non-finite/inverted box, a
+  non-negative-int32 `userData` violation, or (insert) a box aliasing the tree's
+  own `bboxes` buffer. This only affects calls that were already silent bugs.
+- The `updateLeaf` fast path is UNCHANGED (zero new instructions): it never
+  writes `newAABB`, so poison there cannot corrupt the tree. Validation lives at
+  `insertLeaf` and on the `updateLeaf` slow path only. `query` gains no door --
+  a read-only probe cannot poison the tree, and a non-finite or empty-sentinel
+  query box has well-defined, pinned behaviour (0 hits).
+
+### Policy (documented, not enforced)
+- **B-11** a plain `Array` or `Float64Array` box is accepted and coerced to f32
+  on store; only its values are validated, not its type. Pass a `Float32Array`:
+  the `updateLeaf` fast path compares against f32-rounded stored bounds, so a
+  `Float64Array` value within one f32 ulp of the fat boundary can take the fast
+  path yet lie just outside the stored box (a silent query miss). Enforcing the
+  type would cost the fast path, which is the one thing this package protects.
+
+### Known issues (unfixed; later sessions)
+- **B-07 / B-08** tree rotations and the query-stack growth on degenerate trees
+  are the B3 session.
+
 ## [1.0.2] - 2026-07-28
 
 Structural integrity. The six S1 ways to silently corrupt a tree with a
@@ -101,5 +160,6 @@ silent way to corrupt a tree with a plain-looking call:
 - **B-05** `removeLeaf(internalNodeId)` silently destroys the tree.
 - **B-06** `updateLeaf(freedId, ...)` resurrects a removed entity.
 
+[1.1.0]: https://github.com/PeshoVurtoleta/lite-bvh/releases/tag/v1.1.0
 [1.0.2]: https://github.com/PeshoVurtoleta/lite-bvh/releases/tag/v1.0.2
 [1.0.1]: https://github.com/PeshoVurtoleta/lite-bvh/releases/tag/v1.0.1

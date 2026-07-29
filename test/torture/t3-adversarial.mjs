@@ -8,8 +8,9 @@
  *
  * B1 remit: insert orders, remove orders, capacity boundary, teleport churn,
  * finite margins. Height BOUNDS are NOT asserted here -- rotations are B3, so a
- * tall monotone tree is expected and only its CORRECTNESS is gated. NaN margins
- * / non-finite boxes (poison) belong to B2's quarantine tier, not here.
+ * tall monotone tree is expected and only its CORRECTNESS is gated. Since B2,
+ * the margin sweep also asserts that a non-finite margin is rejected atomically;
+ * non-finite / inverted LEAF boxes (poison entry) are T8's cross-package tier.
  */
 
 import { DynamicBVH2D } from '../../Bvh.js';
@@ -152,8 +153,10 @@ export function run() {
         assertHealthy(tree, N, 'teleport');
     }
 
-    // --- finite margins (NaN margin is B2) -----------------------------------
-    for (const margin of [0, -1, Infinity]) {
+    // --- margins: finite churns; non-finite is quarantined atomically (B2) ---
+    // 0 and -1 always produce a valid fattened box (a negative margin can shrink
+    // to a zero-size box -- still valid: min == max). So they churn cleanly.
+    for (const margin of [0, -1]) {
         const N = 200;
         const { tree, ids } = build(N, (i) => { const x = i * 5; return B(x, 0, x + 2, 2); });
         const tight = new Float32Array(4);
@@ -164,6 +167,20 @@ export function run() {
         tree.validate();
         check(reachableCount(tree) === tree.nodeCount,
             () => `T3.margin=${margin}: reachable != nodeCount`);
+    }
+    // Infinity / -Infinity / NaN margins de-finite or invert the fattened box, so
+    // the B2 door throws -- and it must throw ATOMICALLY, before removeLeaf, so
+    // the leaf stays live and the tree byte-valid.
+    for (const margin of [Infinity, -Infinity, NaN]) {
+        const { tree, ids } = build(4, (i) => { const x = i * 5; return B(x, 0, x + 2, 2); });
+        const tight = setBox(new Float32Array(4), 9000, 0, 9002, 2); // breaches -> slow path
+        const before = tree.nodeCount;
+        let threw = false;
+        try { tree.updateLeaf(ids[0], tight, margin); } catch { threw = true; }
+        check(threw, () => `T3.margin=${margin}: non-finite margin must throw`);
+        check(tree._isLiveLeaf(ids[0]), () => `T3.margin=${margin}: leaf lost on a rejected update`);
+        check(tree.nodeCount === before, () => `T3.margin=${margin}: nodeCount moved on a rejected update`);
+        tree.validate();
     }
 
     // --- capacity boundary: maxNodes-1, maxNodes, one past (B-01) ------------

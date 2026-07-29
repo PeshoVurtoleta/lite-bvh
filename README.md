@@ -270,16 +270,16 @@ A tree holding `N` leaves uses at most `2N - 1` total nodes (when fully populate
 
 | Method | Returns | Description |
 |---|---|---|
-| `insertLeaf(leafAABB, data)` | `number` (node id) | Inserts a leaf. **Store the returned id.** Throws at capacity — atomically, before any mutation, so the tree is left valid. |
+| `insertLeaf(leafAABB, data)` | `number` (node id) | Inserts a leaf. **Store the returned id.** `data` must be a non-negative int32. **Throws** — atomically, before any mutation — at capacity, on a non-finite or inverted box, on a bad `data`, or on a box aliasing the tree's own `bboxes`. |
 | `removeLeaf(leaf)` | `void` | Removes a leaf, heals the gap, returns nodes to the free list. **Throws** on an invalid, freed, or non-leaf (internal) handle. |
-| `updateLeaf(leaf, newAABB, margin)` | `number` (node id) | Fast path: returns `leaf` unchanged if still contained. Slow path: removes, fattens by `margin`, re-inserts; returns a (possibly new) id. **Throws** on an invalid/freed handle. **Always reassign your stored handle from the return value.** |
-| `query(queryAABB, outBuffer)` | `number` (hit count) | Writes intersecting leaves' `userData` into `outBuffer`. Stops early when the buffer fills; a zero-length buffer returns `0`. |
+| `updateLeaf(leaf, newAABB, margin)` | `number` (node id) | Fast path: returns `leaf` unchanged if still contained. Slow path: removes, fattens by `margin`, re-inserts; returns a (possibly new) id. **Throws** on an invalid/freed handle, or (slow path, atomically) when the fattened box is non-finite or inverted. **Always reassign your stored handle from the return value.** |
+| `query(queryAABB, outBuffer)` | `number` (hit count) | Writes intersecting leaves' `userData` into `outBuffer`. Stops early when the buffer fills; a zero-length buffer returns `0`. Read-only — takes no quarantine door, so a non-finite or empty-sentinel query box returns `0` rather than throwing. |
 | `validate()` | `true` | **Debug/test only, O(n).** Throws naming the first offending node if the tree is inconsistent. Never call it on a hot path. |
 
 ### Conventions
 
-- **AABB format:** `Float32Array` of length 4, `[minX, minY, maxX, maxY]`. Identical to `@zakkster/lite-aabb` format.
-- **`userData`:** any `int32`. Negative values are legal but `-1` is reserved internally for "no data" on internal nodes — don't use `-1` as a leaf id if you plan to read raw `userData[id]`.
+- **AABB format:** `Float32Array` of length 4, `[minX, minY, maxX, maxY]`. Identical to `@zakkster/lite-aabb` format. A box must be finite and non-inverted (`minX <= maxX`, `minY <= maxY`) to enter the tree. A plain `Array`/`Float64Array` is accepted and coerced to f32, but pass a `Float32Array` — the `updateLeaf` fast path compares against f32-rounded bounds, so a `Float64Array` within one f32 ulp of the fat boundary can slip the fast path (a silent miss).
+- **`userData`:** a **non-negative int32** (`[0, 2^31-1]`). `-1` is reserved as the internal-node sentinel; `2**31` and `3.7` (which would wrap/truncate) are rejected at the door.
 - **`outBuffer`:** caller-owned `Int32Array`. The library never holds a reference past the call.
 
 ---
@@ -306,6 +306,7 @@ A `DynamicBVH2D(4096)` is therefore **~160 KB** of backing buffers, comfortably 
 
 - **Capacity exhaustion throws synchronously** at `insertLeaf` — at the *boundary*, never partway through. Capacity is reserved before the first write, so the tree is left byte-unchanged and still valid; keep using it.
 - **Handles are validated, fail-closed.** `removeLeaf` and `updateLeaf` throw on a handle that is out of range, non-integer, an internal node, or already freed — so a double-remove or a stale id can never silently corrupt the tree. The check is O(1) (a range test and one array read); it does not walk the tree.
+- **Poison is quarantined at the door.** A non-finite (NaN/Infinity) or inverted box can no longer enter the tree and silently kill it — one NaN leaf used to propagate to the root and make every query return `0` forever. `insertLeaf` (and `updateLeaf`'s slow path, before it removes anything) reject it atomically. The `updateLeaf` fast path and `query` inner loop take **no** new instructions — a query box is never stored, so it needs no door. `validate()` is the backstop: it now names any non-finite or inverted bbox.
 - **`updateLeaf`'s fast path is O(1).** The handle check (a range test + one `children` read), then four `bboxes` reads and four `<=/>=` comparisons. No allocation — gated by the torture suite at `maxArrayBuffersGrowth: 0`.
 - **`validate()` is available for tests and debugging.** It re-derives every structural invariant in O(n) and throws on the first violation. Not for hot paths.
 - **Removing the root** transitions the tree to empty cleanly (`root = -1`, `nodeCount = 0`).
@@ -319,23 +320,23 @@ A `DynamicBVH2D(4096)` is therefore **~160 KB** of backing buffers, comfortably 
 ## Testing
 
 ```bash
-npm test
-# or: node --expose-gc Bvh.test.js
+npm test         # node:test unit suite + structural-integrity regressions
+npm run torture  # zero-GC / structural gate → prints exactly "ok"
+npm run verify   # both, in order
 ```
 
-Runs 24 deterministic assertions covering:
+`npm test` runs the `node:test` suite (`test/Bvh.test.js` + `test/regressions.test.js`), covering:
 
 | Group | What's tested |
 |---|---|
-| Construction | SoA sizes, free-list chain, initial state |
-| Insert | single leaf, internal parent creation, distinct ids, capacity throw |
-| Query | empty tree, single leaf, miss, multiple hits, enclosing query, touching edges, early stop on full buffer |
+| Construction | SoA sizes, free-list chain, initial state, `maxNodes` validation |
+| Insert | single leaf, internal parent creation, distinct ids, atomic capacity throw |
+| Query | empty tree, single leaf, miss, multiple hits, enclosing query, touching edges, early stop, zero-length buffer |
 | Remove | only leaf, sibling promotion, unfindability, capacity reusability |
-| Update | fast path (same id), slow path (new id at new position), user-data preservation, margin correctness |
-| Stress | 500-leaf scatter + exhaustive queries + bulk removal + 10-frame update cycling |
-| **Zero-allocation guarantee** | 100 000 mixed query+update ops → heap growth < 512 KB under `--expose-gc` |
+| Update | fast path (same id), slow path (new id), user-data preservation, margin correctness |
+| Regressions | every S1/S2 finding (B-01…B-06, B-09, B-03, B-10, B-11, B-12, A-05) has a named before/after test |
 
-A clean run ends with `24 passed, 0 failed` and exit code `0`.
+The **zero-allocation guarantee is not a heap-growth heuristic.** It is gated by the torture suite (tier T6) at `maxArrayBuffersGrowth: 0` with `stabilize: 'deep'`, plus a direct `queryStack.length` / `bboxes.buffer.byteLength` assertion — because the tree's buffers live in ArrayBuffer backing stores *outside* the V8 heap, where a heap-growth gate is blind. Tier T8 additionally proves cross-package agreement with `@zakkster/lite-aabb`. `node --expose-gc test/torture.mjs` prints exactly `ok`.
 
 ---
 

@@ -26,7 +26,7 @@ export class DynamicBVH2D {
     readonly children: Int32Array;
     /** Int32Array(maxNodes) — subtree height; 0 for leaves. */
     readonly heights: Int32Array;
-    /** Int32Array(maxNodes) — user data per leaf (e.g. ECS entity id). */
+    /** Int32Array(maxNodes) — user data per leaf (non-negative int32; -1 marks an internal node). */
     readonly userData: Int32Array;
 
     /** Int32Array(maxNodes) -- free-list chain: `nextFree[id]` is the next free node id, or -1. */
@@ -56,17 +56,23 @@ export class DynamicBVH2D {
     /**
      * Inserts a leaf using the Surface Area Heuristic. O(log n) average.
      *
-     * @param leafAABB Length-4 box (typically pre-fattened by the caller).
-     * @param data User-defined integer (e.g. ECS entity id) returned by `query()`
-     *   for matching leaves.
+     * @param leafAABB Length-4 box (typically pre-fattened by the caller). Pass a
+     *   `Float32Array`; a plain `Array`/`Float64Array` is accepted and coerced by
+     *   value (see `updateLeaf` for the f32 fast-path caveat).
+     * @param data User integer returned by `query()`. **Must be a non-negative
+     *   int32** (`[0, 2^31-1]`); `-1` is the internal-node sentinel.
      * @returns The new node id. **Store this** to call `updateLeaf`/`removeLeaf`.
-     * @throws When `nodeCount` would exceed `maxNodes`.
+     * @throws When capacity is exhausted; when `leafAABB` is non-finite or
+     *   inverted (`minX > maxX` or `minY > maxY`); when `data` is not a
+     *   non-negative int32; or when `leafAABB` aliases the tree's `bboxes` buffer.
+     *   Every throw is atomic -- the tree is left byte-unchanged and still valid.
      */
     insertLeaf(leafAABB: Float32Array, data: number): number;
 
     /**
      * Removes a leaf, heals the gap by promoting its sibling, and returns the
-     * nodes to the free-list. O(log n).
+     * nodes to the free-list. O(log n). Throws on an invalid, freed, or non-leaf
+     * (internal) handle.
      */
     removeLeaf(leaf: number): void;
 
@@ -75,12 +81,25 @@ export class DynamicBVH2D {
      * nothing changes — the same id is returned.
      * Slow path (O(log n)): removes, fattens by `margin`, re-inserts; returns
      * a new id. **Always reassign your stored handle from the return value.**
+     *
+     * Pass a `Float32Array`: the fast path compares `newAABB` directly against
+     * f32-rounded stored bounds, so a `Float64Array` value within one f32 ulp of
+     * the fat boundary can take the fast path yet lie just outside the stored box
+     * (a silent query miss). Non-`Float32Array` inputs are coerced on the slow
+     * path only.
+     *
+     * @throws On an invalid/freed handle; or, on the slow path, when the fattened
+     *   box would be non-finite or inverted (e.g. a non-finite `margin`, or a
+     *   negative `margin` larger than half the box width). A slow-path throw is
+     *   atomic -- the leaf is NOT removed.
      */
     updateLeaf(leaf: number, newAABB: Float32Array, margin: number): number;
 
     /**
      * Iterative AABB query. Zero allocations: matches are written into the
-     * caller's `outBuffer`. Stops early when the buffer fills.
+     * caller's `outBuffer`. Stops early when the buffer fills. Read-only -- it
+     * takes no quarantine door; a non-finite or empty-sentinel query box returns
+     * 0 hits rather than throwing.
      *
      * @returns Hit count. Read the prefix as `outBuffer.subarray(0, hitCount)`.
      */
@@ -90,12 +109,20 @@ export class DynamicBVH2D {
      * Full structural self-check. **O(n); debug and test only -- never on a hot
      * path.** Throws an `Error` naming the first offending node; returns `true`
      * when the tree is internally consistent (free-list conservation, reciprocal
-     * links, correct heights, bbox containment, node markers, reachable count).
+     * links, correct heights, bbox containment, node markers, reachable count,
+     * and every stored bbox finite and non-inverted).
      */
     validate(): true;
 
     /** True iff `id` is a currently-allocated leaf. O(1). Internal/test guard. */
     _isLiveLeaf(id: number): boolean;
+
+    /**
+     * The quarantine predicate: all four bounds finite AND `minX <= maxX` and
+     * `minY <= maxY`. O(1). Matches `@zakkster/lite-aabb`'s `isValid`.
+     * Internal/test guard.
+     */
+    _isValidBox(a: ArrayLike<number>): boolean;
 }
 
 /** Package version. In three-place sync with `package.json` and `CHANGELOG.md`. */

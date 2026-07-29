@@ -41,7 +41,7 @@ function queryIds(tree, query, max = 1024) {
 // =============================================================================
 
 test('VERSION is exported and in three-place sync', () => {
-    assert.equal(VERSION, '1.0.2');
+    assert.equal(VERSION, '1.1.0');
 });
 
 // =============================================================================

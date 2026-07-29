@@ -146,6 +146,24 @@ export class DynamicBVH2D {
     }
 
     /**
+     * The quarantine predicate (B-03/A-05). A box may enter the tree only if all
+     * four bounds are finite AND `minX <= maxX && minY <= maxY`. This is exactly
+     * `@zakkster/lite-aabb`'s `isValid` (1.1.0) -- copied inline, by contract, so
+     * the two packages agree on what "broken box" means with no runtime dep.
+     *
+     * Reading `a[3]` on a short buffer yields `undefined`, which is not finite,
+     * so a 3-element input is rejected here too (T4). A plain `Array` or
+     * `Float64Array` whose four values are finite and ordered is accepted and
+     * coerced to f32 on store; see the `updateLeaf` note on the f32 fast-path
+     * caveat for non-`Float32Array` inputs (B-11).
+     */
+    _isValidBox(a) {
+        return Number.isFinite(a[0]) && Number.isFinite(a[1]) &&
+               Number.isFinite(a[2]) && Number.isFinite(a[3]) &&
+               a[0] <= a[2] && a[1] <= a[3];
+    }
+
+    /**
      * Inserts an AABB as a leaf, using the Surface Area Heuristic to pick a
      * sibling. O(log n) average. Throws when capacity is exhausted.
      *
@@ -157,6 +175,28 @@ export class DynamicBVH2D {
      *   or `removeLeaf` later.
      */
     insertLeaf(leafAABB, data) {
+        // B-03/A-05: the quarantine door. Reject a non-finite or inverted box
+        // BEFORE any mutation, so poison can never reach `_refit` and propagate
+        // NaN up to the root (after which every query returns 0, forever). A NaN
+        // box is a valid Float32Array(4) that passes handle validation, so this
+        // is a separate door from the B1 handle checks.
+        if (!this._isValidBox(leafAABB)) {
+            throw new Error('lite-bvh: insertLeaf rejected a non-finite or inverted box');
+        }
+        // B-10: userData must be a non-negative int32. `-1` is the internal-node
+        // sentinel; `(data | 0) === data` rejects non-integers (3.7) and values
+        // outside int32 (2**31, which would wrap negative in the Int32Array);
+        // `data >= 0` reserves the whole negative half, sentinel included.
+        if ((data | 0) !== data || data < 0) {
+            throw new Error('lite-bvh: insertLeaf userData must be a non-negative int32, got ' + data);
+        }
+        // B-12: a view into the tree's own bboxes buffer aliases memory the SAH
+        // descent reads while `_mergeNodesToAABB` writes it -- undefined. Forbid
+        // it. A plain Array (`.buffer === undefined`) never equals bboxes.buffer.
+        if (leafAABB.buffer === this.bboxes.buffer) {
+            throw new Error('lite-bvh: insertLeaf leafAABB must not alias the tree bboxes buffer');
+        }
+
         // B-01: reserve capacity atomically, BEFORE the first mutation. A
         // non-empty tree needs two free nodes (the leaf plus a new internal
         // parent); an empty tree needs one. Checking up front means a capacity
@@ -260,6 +300,12 @@ export class DynamicBVH2D {
     /**
      * Iterative range query — finds every leaf whose AABB intersects `queryAABB`.
      * Zero allocations: matches are written into the caller-provided `outBuffer`.
+     *
+     * `query` is a read-only probe: it never writes the tree, so it needs no
+     * quarantine door and its hot inner loop takes no validation. A degenerate
+     * query box has well-defined, pinned behaviour rather than a silent trap --
+     * a NaN-bearing box and the canonical empty sentinel `[Inf,Inf,-Inf,-Inf]`
+     * both return 0 hits (every bbox comparison is `false`). See torture T1.
      *
      * @param {Float32Array} queryAABB Length-4 box to test against.
      * @param {Int32Array} outBuffer User-provided buffer; will receive the
@@ -376,6 +422,13 @@ export class DynamicBVH2D {
      * id is returned. **Always reassign your stored handle from the return
      * value** — the leaf id may change.
      *
+     * Pass a `Float32Array`. The fast path compares `newAABB` directly against
+     * the f32-rounded stored bounds; a `Float64Array` value sitting within one
+     * f32 ulp of the fat boundary can take the fast path yet lie just outside
+     * the stored box, a silent query miss (B-11). Non-`Float32Array` inputs are
+     * accepted and coerced on the SLOW path, never rejected -- the fast path
+     * stays type-agnostic and allocation-free.
+     *
      * @param {number} leaf Current node id.
      * @param {Float32Array} newAABB The exact, tight bounds of the moved object.
      * @param {number} margin Fattening to apply on the slow path. Larger margin =
@@ -402,15 +455,21 @@ export class DynamicBVH2D {
             return leaf;
         }
 
-        // Slow path: extract user data, remove, fatten in scratch, re-insert.
-        const data = this.userData[leaf];
-        this.removeLeaf(leaf);
-
+        // Slow path: fatten into scratch and validate the fattened box BEFORE
+        // removing the leaf, so a poison update is atomic -- it throws with the
+        // leaf still exactly where it was, not removed-then-orphaned. This also
+        // catches a non-finite `margin` and A-05's negative-margin inversion (a
+        // valid tight box + a margin more negative than half its width inverts).
         this._scratchAABB[0] = newAABB[0] - margin;
         this._scratchAABB[1] = newAABB[1] - margin;
         this._scratchAABB[2] = newAABB[2] + margin;
         this._scratchAABB[3] = newAABB[3] + margin;
+        if (!this._isValidBox(this._scratchAABB)) {
+            throw new Error('lite-bvh: updateLeaf rejected a non-finite or inverted fattened box');
+        }
 
+        const data = this.userData[leaf];
+        this.removeLeaf(leaf);
         return this.insertLeaf(this._scratchAABB, data);
     }
 
@@ -510,6 +569,16 @@ export class DynamicBVH2D {
             reachable++;
             if (reachable > max) throw new Error('lite-bvh: validate: tree has a cycle');
 
+            // B-03 poison detector: every stored bbox must be finite and ordered.
+            // The containment test below is NaN-blind (`NaN > NaN` is false), so a
+            // poisoned node would slip past it -- this catch names the offender.
+            const vb = n << 2;
+            if (!(Number.isFinite(this.bboxes[vb]) && Number.isFinite(this.bboxes[vb + 1]) &&
+                  Number.isFinite(this.bboxes[vb + 2]) && Number.isFinite(this.bboxes[vb + 3]) &&
+                  this.bboxes[vb] <= this.bboxes[vb + 2] && this.bboxes[vb + 1] <= this.bboxes[vb + 3])) {
+                throw new Error('lite-bvh: validate: node ' + n + ' has a non-finite or inverted bbox');
+            }
+
             const cIdx = n << 1;
             const l = this.children[cIdx];
             const r = this.children[cIdx + 1];
@@ -560,4 +629,4 @@ export class DynamicBVH2D {
  * `version`, and the top entry of `CHANGELOG.md`. A release that touches one
  * without the other two is a broken release.
  */
-export const VERSION = '1.0.2';
+export const VERSION = '1.1.0';

@@ -60,4 +60,26 @@ export function run() {
     let caught = false;
     try { t2.validate(); } catch { caught = true; }
     if (!caught) die('T9 control: validate() passed a tree with a broken parent link');
+
+    // Control 5 -- the B2 poison detector. Bypass the insertLeaf door by writing
+    // a NaN straight into a live leaf's bbox, and confirm validate() names it.
+    // The door stops poison at entry; this proves validate() is the backstop if
+    // poison ever arrives another way. A NaN that validates clean is invisible.
+    const t3 = new DynamicBVH2D(16);
+    const leaf = t3.insertLeaf(setBox(new Float32Array(4), 0, 0, 1, 1), 0);
+    t3.insertLeaf(setBox(new Float32Array(4), 5, 5, 6, 6), 1);
+    t3.validate(); // healthy first
+    t3.bboxes[leaf << 2] = NaN; // poison a bound behind the door's back
+    let caughtPoison = false;
+    try { t3.validate(); } catch { caughtPoison = true; }
+    if (!caughtPoison) die('T9 control: validate() passed a tree with a NaN bbox');
+
+    // ... and the inverted-bbox variant (min > max) is caught the same way.
+    const t4 = new DynamicBVH2D(16);
+    const lf = t4.insertLeaf(setBox(new Float32Array(4), 0, 0, 1, 1), 0);
+    t4.insertLeaf(setBox(new Float32Array(4), 5, 5, 6, 6), 1);
+    t4.bboxes[(lf << 2) + 2] = -9; // maxX < minX
+    let caughtInv = false;
+    try { t4.validate(); } catch { caughtInv = true; }
+    if (!caughtInv) die('T9 control: validate() passed a tree with an inverted bbox');
 }

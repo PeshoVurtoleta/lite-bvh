@@ -12,8 +12,10 @@ class DynamicBVH2D {
     // else throws a library Error. A two-leaf tree needs at least 3 nodes.
     constructor(maxNodes: number);
 
-    // O(log n) insert via SAH descent. Throws on capacity exhaustion —
-    // atomically, before any mutation, so the tree stays valid.
+    // O(log n) insert via SAH descent. `data` must be a non-negative int32
+    // (-1 is the internal sentinel). THROWS -- atomically, before any mutation --
+    // on capacity exhaustion, a non-finite or inverted box, a bad `data`, or a
+    // box aliasing the tree's own `bboxes` buffer.
     insertLeaf(leafAABB: Float32Array, data: number): number;       // returns node id
 
     // O(log n) remove. Heals the gap by promoting the sibling.
@@ -22,15 +24,17 @@ class DynamicBVH2D {
 
     // O(1) fast path when newAABB still contained inside fat bounds.
     // O(log n) slow path: remove, fatten by margin, re-insert.
-    // THROWS on an invalid/freed handle. ALWAYS reassign your stored id.
+    // THROWS on an invalid/freed handle, or (slow path, atomically) when the
+    // fattened box is non-finite or inverted. ALWAYS reassign your stored id.
     updateLeaf(leaf: number, newAABB: Float32Array, margin: number): number;
 
     // Iterative AABB-overlap query. Writes leaves' userData into outBuffer.
-    // Stops early when outBuffer fills; a zero-length buffer returns 0.
+    // Stops early when outBuffer fills; a zero-length buffer returns 0. Read-only:
+    // no door -- a non-finite or empty-sentinel query box returns 0, not a throw.
     query(queryAABB: Float32Array, outBuffer: Int32Array): number;  // returns hit count
 
-    // Debug/test only, O(n). Throws naming the first bad node, else returns
-    // true. NEVER call on a hot path.
+    // Debug/test only, O(n). Throws naming the first bad node (including a
+    // non-finite or inverted bbox), else returns true. NEVER call on a hot path.
     validate(): true;
 
     // Read-only stats
@@ -42,8 +46,8 @@ class DynamicBVH2D {
 
 ## Format
 
-- **AABB:** `Float32Array(4)` = `[minX, minY, maxX, maxY]`. Identical to `@zakkster/lite-aabb`.
-- **`userData`:** any `int32` you want returned from `query()` — typically an ECS entity id.
+- **AABB:** `Float32Array(4)` = `[minX, minY, maxX, maxY]`. Identical to `@zakkster/lite-aabb`. Must be finite and non-inverted (`minX <= maxX`, `minY <= maxY`) to enter the tree. A plain `Array`/`Float64Array` is accepted and coerced, but pass a `Float32Array` for exact `updateLeaf` fast-path behaviour.
+- **`userData`:** a non-negative `int32` (`[0, 2^31-1]`) returned from `query()` — typically an ECS entity id. `-1` is reserved (internal-node sentinel).
 - **`outBuffer`:** caller-owned `Int32Array`; size for your worst-case query batch.
 
 ## The margin parameter
