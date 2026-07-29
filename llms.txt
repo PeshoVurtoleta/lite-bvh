@@ -31,15 +31,19 @@ class DynamicBVH2D {
     // Iterative AABB-overlap query. Writes leaves' userData into outBuffer.
     // Stops early when outBuffer fills; a zero-length buffer returns 0. Read-only:
     // no door -- a non-finite or empty-sentinel query box returns 0, not a throw.
+    // Never allocates: the traversal stack is fixed-size (rotations bound height
+    // to O(log n)); an impossible overflow throws fail-closed, never grows.
     query(queryAABB: Float32Array, outBuffer: Int32Array): number;  // returns hit count
 
     // Debug/test only, O(n). Throws naming the first bad node (including a
     // non-finite or inverted bbox), else returns true. NEVER call on a hot path.
     validate(): true;
 
-    // Read-only stats
+    // Read-only stats (all O(1))
     readonly maxNodes: number;
     readonly nodeCount: number;
+    readonly leafCount: number;  // live leaves; nodeCount === 2*leafCount - 1
+    readonly height: number;     // root height in edges: -1 empty, 0 one leaf
     readonly root: number;       // -1 if empty
 }
 ```
@@ -83,7 +87,10 @@ Leaves are stored with **fat** bounds — the entity's bounds inflated by `margi
 Box2D `b2_dynamicTree` ported to flat typed arrays:
 - Insert: Surface Area Heuristic descent picks the cheapest sibling.
 - Refit: walk parent chain, merge child bboxes into parent bbox.
-- No rotation rebalancing yet — SAH descent alone produces balanced trees for typical game workloads.
+- Rebalance: Box2D-style single rotations in the refit walk keep height at
+  O(log n) under any insert order (a monotone sort no longer degrades the tree
+  into a linked list). Rotations are on the insert/remove path only, never on
+  the `updateLeaf` fast path or in `query`.
 
 ## Install
 

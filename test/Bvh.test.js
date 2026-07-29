@@ -41,7 +41,7 @@ function queryIds(tree, query, max = 1024) {
 // =============================================================================
 
 test('VERSION is exported and in three-place sync', () => {
-    assert.equal(VERSION, '1.1.0');
+    assert.equal(VERSION, '1.2.0');
 });
 
 // =============================================================================
@@ -341,6 +341,46 @@ test('stress: insert + updateLeaf cycling preserves correctness', () => {
         const hits = queryIds(tree, box(x, y, x, y));
         assert.ok(hits.includes(i), `entity ${i} not at expected position after movement`);
     }
+});
+
+// =============================================================================
+// TELEMETRY & ROTATIONS (B3)
+// =============================================================================
+
+test('height and leafCount track the tree', () => {
+    const tree = new DynamicBVH2D(64);
+    assert.equal(tree.height, -1, 'empty tree height is -1');
+    assert.equal(tree.leafCount, 0, 'empty tree has no leaves');
+
+    const a = tree.insertLeaf(box(0, 0, 1, 1), 0);
+    assert.equal(tree.height, 0, 'a single leaf has height 0');
+    assert.equal(tree.leafCount, 1);
+
+    tree.insertLeaf(box(5, 5, 6, 6), 1);
+    assert.equal(tree.leafCount, 2);
+    assert.equal(tree.height, 1, 'two leaves under one internal node -> height 1');
+
+    for (let i = 2; i < 20; i++) tree.insertLeaf(box(i * 3, 0, i * 3 + 1, 1), i);
+    assert.equal(tree.leafCount, 20);
+    // 20 leaves balance to ceil(log2(20)) = 5 -ish; assert the loose bound holds.
+    assert.ok(tree.height <= 2 * Math.ceil(Math.log2(20)) + 2);
+
+    tree.removeLeaf(a);
+    assert.equal(tree.leafCount, 19);
+    tree.validate();
+});
+
+test('rotations keep a monotone insert order shallow (B-07)', () => {
+    const N = 5000;
+    const tree = new DynamicBVH2D(4 * N + 8);
+    const probe = new Float32Array(4);
+    for (let i = 0; i < N; i++) tree.insertLeaf(setBox(probe, i, 0, i + 100, 10), i);
+    // Without rotations this is a linked list (height N-1). With them: O(log n).
+    assert.ok(tree.height <= 2 * Math.ceil(Math.log2(N)) + 2,
+        `monotone height ${tree.height} not bounded`);
+    assert.equal(tree.leafCount, N);
+    assert.equal(tree.queryStack.length, 256, 'stack never grew');
+    tree.validate();
 });
 
 // =============================================================================

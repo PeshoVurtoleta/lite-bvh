@@ -207,7 +207,7 @@ sequenceDiagram
     Q-->>App: return hit count
 ```
 
-The stack auto-grows on pathological tree depths (it doubles when full), but for any practical tree it never reallocates after the first frame.
+The traversal stack is **fixed-size and never grows.** The DFS uses at most `height + 1` slots, and tree rotations (below) keep height at O(log n), so the 256-slot stack is never exhausted by a well-formed tree — a balanced tree would need ~2^250 nodes to fill it. If it ever overflows, the tree is more degenerate than rotations permit (i.e. corrupt), and `query` throws rather than silently allocating a bigger stack inside the hot loop. (Before v1.2.0 the stack doubled on overflow, which an adversarial insert order could trigger — a silent allocation in the query path. See [B-08](CHANGELOG.md).)
 
 ---
 
@@ -263,6 +263,8 @@ A tree holding `N` leaves uses at most `2N - 1` total nodes (when fully populate
 |---|---|---|
 | `maxNodes` | `number` | As constructed. |
 | `nodeCount` | `number` | Live nodes (leaves + internal). Useful for telemetry. |
+| `leafCount` | `number` | Live leaves. O(1). |
+| `height` | `number` | Root height in edges: `-1` empty, `0` a single leaf, else the longest root-to-leaf path. O(1); tracks ~`ceil(log2(leafCount))`. |
 | `root` | `number` | Root node id, or `-1` if empty. |
 | `bboxes` `parents` `children` `heights` `userData` | TypedArray | The SoA backing arrays. Read-only in practice; exposed for debug visualization and unit tests. |
 
@@ -273,7 +275,7 @@ A tree holding `N` leaves uses at most `2N - 1` total nodes (when fully populate
 | `insertLeaf(leafAABB, data)` | `number` (node id) | Inserts a leaf. **Store the returned id.** `data` must be a non-negative int32. **Throws** — atomically, before any mutation — at capacity, on a non-finite or inverted box, on a bad `data`, or on a box aliasing the tree's own `bboxes`. |
 | `removeLeaf(leaf)` | `void` | Removes a leaf, heals the gap, returns nodes to the free list. **Throws** on an invalid, freed, or non-leaf (internal) handle. |
 | `updateLeaf(leaf, newAABB, margin)` | `number` (node id) | Fast path: returns `leaf` unchanged if still contained. Slow path: removes, fattens by `margin`, re-inserts; returns a (possibly new) id. **Throws** on an invalid/freed handle, or (slow path, atomically) when the fattened box is non-finite or inverted. **Always reassign your stored handle from the return value.** |
-| `query(queryAABB, outBuffer)` | `number` (hit count) | Writes intersecting leaves' `userData` into `outBuffer`. Stops early when the buffer fills; a zero-length buffer returns `0`. Read-only — takes no quarantine door, so a non-finite or empty-sentinel query box returns `0` rather than throwing. |
+| `query(queryAABB, outBuffer)` | `number` (hit count) | Writes intersecting leaves' `userData` into `outBuffer`. Stops early when the buffer fills; a zero-length buffer returns `0`. Read-only — takes no quarantine door, so a non-finite or empty-sentinel query box returns `0` rather than throwing. Never allocates (the fixed traversal stack throws fail-closed on the impossible overflow rather than growing). |
 | `validate()` | `true` | **Debug/test only, O(n).** Throws naming the first offending node if the tree is inconsistent. Never call it on a hot path. |
 
 ### Conventions
@@ -313,7 +315,7 @@ A `DynamicBVH2D(4096)` is therefore **~160 KB** of backing buffers, comfortably 
 - **Removing one of two leaves** promotes the surviving sibling directly to the root, freeing the internal parent.
 - **`query` is reentrant-safe within a single thread** — the stack is per-instance state but each call reads it from `stackPtr = 0` to `stackPtr = 0`, so back-to-back queries don't interfere. Don't share an instance across Workers.
 - **`Float32` precision (~7 decimal digits)** is fine for typical world bounds; for million-unit scenes consider chunking or swapping the type.
-- **No tree rebalancing yet.** The SAH descent produces well-balanced trees in steady-state for typical game workloads. Pathological insertion sequences could still produce a tree that's deeper than ideal; see [roadmap](#limitations--roadmap).
+- **The tree self-balances with rotations.** `_refit` applies Box2D-style single rotations on every insert and remove, so `height` stays O(log n) regardless of insert order. A monotone (sorted) insert of 20,000 leaves — which used to build a height-19,999 linked list — is now height 15, and building it is ~300× faster. Watch `tree.height` to confirm; the torture suite pins it `<= 2·ceil(log2(leafCount)) + 2` under every adversarial order.
 
 ---
 
@@ -334,9 +336,10 @@ npm run verify   # both, in order
 | Query | empty tree, single leaf, miss, multiple hits, enclosing query, touching edges, early stop, zero-length buffer |
 | Remove | only leaf, sibling promotion, unfindability, capacity reusability |
 | Update | fast path (same id), slow path (new id), user-data preservation, margin correctness |
-| Regressions | every S1/S2 finding (B-01…B-06, B-09, B-03, B-10, B-11, B-12, A-05) has a named before/after test |
+| Telemetry & rotations | `height`/`leafCount` accessors; monotone insert stays height-bounded |
+| Regressions | every S1/S2 finding (B-01…B-12, A-05) has a named before/after test |
 
-The **zero-allocation guarantee is not a heap-growth heuristic.** It is gated by the torture suite (tier T6) at `maxArrayBuffersGrowth: 0` with `stabilize: 'deep'`, plus a direct `queryStack.length` / `bboxes.buffer.byteLength` assertion — because the tree's buffers live in ArrayBuffer backing stores *outside* the V8 heap, where a heap-growth gate is blind. Tier T8 additionally proves cross-package agreement with `@zakkster/lite-aabb`. `node --expose-gc test/torture.mjs` prints exactly `ok`.
+The **zero-allocation guarantee is not a heap-growth heuristic.** It is gated by the torture suite (tier T6) at `maxArrayBuffersGrowth: 0` with `stabilize: 'deep'`, plus a direct `queryStack.length` / `bboxes.buffer.byteLength` assertion — because the tree's buffers live in ArrayBuffer backing stores *outside* the V8 heap, where a heap-growth gate is blind. Tier T5 (differential fuzz against a brute-force O(N) oracle) proves rotations change the tree's shape but never its answers; tier T8 proves cross-package agreement with `@zakkster/lite-aabb`. `node --expose-gc test/torture.mjs` prints exactly `ok`.
 
 ---
 
@@ -346,7 +349,6 @@ This is a v1 release. Planned additions, in rough order:
 
 | Feature | Why | Difficulty |
 |---|---|---|
-| **Tree rotations during `_refit`** | Box2D-style left/right rotations to keep height bounded even under adversarial insert orders. The `// TODO` is already marked in `Bvh.js`. | Medium |
 | **`raycast(p0, p1, callback)`** | Returns hits along a segment in near-order. Common need for vision/laser/projectile checks. | Medium |
 | **`queryPoint(x, y, outBuffer)`** | Specialized fast path for picking — saves the AABB construction. | Easy |
 | **`closestPoint(p, outBuffer)`** | Nearest-leaf to a point with optional max-distance cap. | Hard |

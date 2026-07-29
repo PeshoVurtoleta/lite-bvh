@@ -82,4 +82,20 @@ export function run() {
     let caughtInv = false;
     try { t4.validate(); } catch { caughtInv = true; }
     if (!caughtInv) die('T9 control: validate() passed a tree with an inverted bbox');
+
+    // Control 6 -- the B3 height gate. Disable rotations (make `_balance` the
+    // identity) and rebuild the monotone B-07 shape: the height MUST blow past
+    // the O(log n) bound the T3/T6 gates assert. If a rotation-less tree still
+    // satisfies the bound, the height assertion is decorative.
+    const N = 4000;
+    const noRot = new DynamicBVH2D(4 * N + 8);
+    noRot._balance = (i) => i; // rotations off
+    const b = new Float32Array(4);
+    for (let i = 0; i < N; i++) noRot.insertLeaf(setBox(b, i, 0, i + 100, 10), i);
+    const bound = 2 * Math.ceil(Math.log2(N)) + 2;
+    if (noRot.height <= bound) {
+        die('T9 control: monotone insert with rotations disabled stayed within the height ' +
+            'bound (' + noRot.height + ' <= ' + bound + ') -- the B3 height gate cannot fail');
+    }
+    noRot.validate(); // a tall tree is still structurally valid -- only unbalanced
 }

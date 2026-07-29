@@ -1,13 +1,14 @@
 /**
- * @zakkster/lite-bvh -- structural-integrity regressions (B1, v1.0.2).
+ * @zakkster/lite-bvh -- finding regressions (B1/B2/B3).
  *
- * These were the five S1 ways to silently corrupt a tree plus the missing
- * constructor validation. In B0 they were `todo` reproductions asserting the
- * desired behaviour; B1 fixes the code and they become hard passing tests.
- * Each names its finding id. Every mutating case ends by asserting
- * `tree.validate()` so a fix that trades one corruption for another is caught.
+ * One passing test per fixed finding, each named by its id, each ending in
+ * `tree.validate()` so a fix that trades one corruption for another is caught:
+ *   - B1 (v1.0.2): structural integrity -- B-01/02/04/05/06/09.
+ *   - B2 (v1.1.0): poison quarantine -- B-03/10/11/12, A-05.
+ *   - B3 (v1.2.0): rotations + query-stack -- B-07 (height bound) and B-08 (query
+ *     no longer allocates), plus the stale-refit-on-remove fix rotations exposed.
  *
- * See decisions/0001-handle-validation.md and CHANGELOG.md.
+ * See decisions/0001..0003 and CHANGELOG.md.
  */
 
 import { test } from 'node:test';
@@ -254,4 +255,83 @@ test('handle validation: removeLeaf/updateLeaf reject out-of-range and junk ids'
     // The genuine live leaf still works.
     assert.equal(tree._isLiveLeaf(a), true);
     tree.validate();
+});
+
+// -----------------------------------------------------------------------------
+// B-07 -- an adversarial (monotone) insert order must NOT degrade the tree.
+// Before rotations this produced height N-1 (19,999 for 20,000 leaves), turning
+// the BVH into a linked list. Rotations keep it O(log n).
+// -----------------------------------------------------------------------------
+test('B-07: monotone insert stays height-bounded (rotations)', () => {
+    const probe = new Float32Array(4);
+    for (const N of [1000, 20000]) {
+        const tree = new DynamicBVH2D(4 * N + 8);
+        for (let i = 0; i < N; i++) {
+            probe[0] = i; probe[1] = 0; probe[2] = i + 100; probe[3] = 10;
+            tree.insertLeaf(probe, i);
+        }
+        const bound = 2 * Math.ceil(Math.log2(N)) + 2;
+        assert.ok(tree.height <= bound,
+            `N=${N}: height ${tree.height} exceeds bound ${bound} (was ${N - 1} pre-rotation)`);
+        assert.equal(tree.leafCount, N);
+        // Every leaf is still findable -- rotations change shape, not answers.
+        const out = new Int32Array(N);
+        const q = Float32Array.of(-1e9, -1e9, 1e9, 1e9);
+        assert.equal(tree.query(q, out), N);
+        tree.validate();
+    }
+});
+
+// -----------------------------------------------------------------------------
+// B-08 -- a query on the (formerly) degenerate tree must not grow queryStack.
+// Before rotations, a full-extent query on the height-19,999 tree grew the stack
+// 256 -> 32,768 by allocating INSIDE the loop, breaking the zero-GC law by data.
+// -----------------------------------------------------------------------------
+test('B-08: query on an adversarial tree does not grow the stack', () => {
+    const N = 20000;
+    const tree = new DynamicBVH2D(4 * N + 8);
+    const probe = new Float32Array(4);
+    for (let i = 0; i < N; i++) {
+        probe[0] = i; probe[1] = 0; probe[2] = i + 100; probe[3] = 10;
+        tree.insertLeaf(probe, i);
+    }
+    const stackBefore = tree.queryStack.length;
+    assert.equal(stackBefore, 256, 'stack should start at its fixed 256 slots');
+    const out = new Int32Array(N);
+    // Full-extent query: visits every node, the worst case for stack depth.
+    assert.equal(tree.query(Float32Array.of(-1e9, -1e9, 1e9, 1e9), out), N);
+    assert.equal(tree.queryStack.length, stackBefore,
+        `queryStack grew ${stackBefore} -> ${tree.queryStack.length} (B-08 regressed)`);
+    tree.validate();
+});
+
+// -----------------------------------------------------------------------------
+// Remove-refit -- a remove must recompute the grandparent it heals into. B3's
+// rotations exposed that removeLeaf refit from one level too high, leaving a
+// stale internal height/bbox. validate() mid-drain would flag it; here we drain
+// and check after every removal.
+// -----------------------------------------------------------------------------
+test('remove refits the healed grandparent (no stale height mid-drain)', () => {
+    const N = 600;
+    const tree = new DynamicBVH2D(4 * N + 8);
+    const ids = [];
+    const probe = new Float32Array(4);
+    for (let i = 0; i < N; i++) {
+        const x = (i * 37) % 4096, y = (i * 71) % 4096;
+        probe[0] = x; probe[1] = y; probe[2] = x + 3; probe[3] = y + 3;
+        ids.push(tree.insertLeaf(probe, i));
+    }
+    tree.validate();
+    // Deterministic shuffle so the drain hits interior removals, then validate
+    // after each one -- a stale grandparent height throws inside validate().
+    for (let i = ids.length - 1; i > 0; i--) {
+        const j = ((i * 2654435761) >>> 0) % (i + 1);
+        const t = ids[i]; ids[i] = ids[j]; ids[j] = t;
+    }
+    for (let k = 0; k < ids.length; k++) {
+        tree.removeLeaf(ids[k]);
+        tree.validate();
+    }
+    assert.equal(tree.nodeCount, 0);
+    assert.equal(tree.root, -1);
 });

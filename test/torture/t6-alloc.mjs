@@ -11,9 +11,12 @@
  * also pin `queryStack.length` and `bboxes.buffer.byteLength` across the window:
  * nothing may grow.
  *
- * The tree here is SCATTERED (well-balanced), so query stays within the initial
- * 256-slot stack. The adversarial B-07/B-08 tree that forces the stack to grow
- * is B3's fix, not B0's gate.
+ * Two trees are gated. The first is SCATTERED (well-balanced). The second is the
+ * ADVERSARIAL monotone B-07 shape: before B3 it degraded to height 19,999 and a
+ * full-extent query grew `queryStack` 256 -> 32,768 by allocating INSIDE the
+ * loop (B-08), breaking the zero-GC law by data alone. With rotations the height
+ * is O(log n) and the stack never grows, so the same gate now passes on it --
+ * that is the executable B-08 fix.
  *
  * BVH_TORTURE_BREAK=1 injects a retained allocation into the hot body: the gate
  * must then reject the window. That is the T9 control, exercisable from here.
@@ -81,6 +84,46 @@ export function run() {
     }
 
     // In BREAK mode the gate was SUPPOSED to reject; reaching here means the
-    // control silently passed, which is itself a failure.
+    // control silently passed, which is itself a failure. (BREAK trips in the
+    // scattered gate above and exits before the adversarial gate below.)
     if (BREAK) die('T6: BVH_TORTURE_BREAK injected allocations but the gate passed');
+
+    // --- B-08: query on the adversarial monotone tree must not allocate ------
+    // The pre-rotation shape (height 19,999) grew the query stack 256 -> 32,768
+    // by allocating inside the loop. With rotations the height is O(log n), the
+    // fixed 256-slot stack never overflows, and this gate passes.
+    {
+        const M = 20000;
+        const adv = new DynamicBVH2D(4 * M + 8);
+        const b = new Float32Array(4);
+        for (let i = 0; i < M; i++) adv.insertLeaf(setBox(b, i, 0, i + 100, 10), i);
+
+        const bound = 2 * Math.ceil(Math.log2(M)) + 2;
+        check(adv.height <= bound,
+            () => `T6: adversarial height ${adv.height} exceeds bound ${bound} -- rotations off?`);
+
+        // A wide sliding window that descends most of the tree every call.
+        const q = new Float32Array(4);
+        const out = new Int32Array(M);
+        const advHot = (i) => {
+            const c = (i * 997) % M;
+            setBox(q, c - 4000, -1, c + 4000, 11);
+            adv.query(q, out);
+        };
+
+        const advStackBefore = adv.queryStack.length;
+        const advBboxBefore = adv.bboxes.buffer.byteLength;
+        const { report: advReport, summary: advSummary } =
+            runOpsGate(advHot, { ops: 8000, warmup: 500 });
+
+        check(adv.queryStack.length === advStackBefore,
+            () => `T6: adversarial queryStack grew ${advStackBefore} -> ${adv.queryStack.length} (B-08 regressed)`);
+        check(adv.bboxes.buffer.byteLength === advBboxBefore,
+            () => `T6: adversarial bboxes backing store grew ${advBboxBefore} -> ${adv.bboxes.buffer.byteLength}`);
+        if (!advReport.ok) {
+            const g = advSummary.gc;
+            die('T6 adversarial alloc gate rejected -- verdict=' + advReport.verdict +
+                ' source=' + advSummary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+        }
+    }
 }

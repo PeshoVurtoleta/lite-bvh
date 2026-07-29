@@ -9,13 +9,15 @@
  * Ten tiers share one shape (see the roadmap section 3). B0 stands up the
  * harness and wires the tiers this package needs now:
  *
- *     T0  metamorphic laws          t3  adversarial insert orders
+ *     T0  metamorphic laws          t3  adversarial insert orders + height bound
  *     T1  degenerate query values   t4  handle / buffer / input abuse
- *     T6  the zero-alloc gate       t7  soak + free-list conservation
- *     T8  cross-package poison door  t9  controls (must be able to fail)
+ *     T5  differential fuzz vs oracle  t6  the zero-alloc gate
+ *     T7  soak + free-list conservation  t8  cross-package poison door
+ *     T9  controls (must be able to fail)
  *
- * T2 (aliasing) and T5 (differential fuzz) are reserved for later sessions and
- * intentionally not registered here. T8 is wired as of B2 (poison quarantine).
+ * T2 (aliasing) is reserved for a later session and intentionally not registered
+ * here. T5 is wired as of B3 (rotations must not change query answers); T8 as of
+ * B2 (poison quarantine).
  *
  * lite-gc-profiler is one-measurement-at-a-time, so tiers run STRICTLY
  * SEQUENTIALLY -- never nested, never concurrent.
@@ -35,6 +37,7 @@ import { run as t0 } from './torture/t0-laws.mjs';
 import { run as t1 } from './torture/t1-degenerate.mjs';
 import { run as t3 } from './torture/t3-adversarial.mjs';
 import { run as t4 } from './torture/t4-handles.mjs';
+import { run as t5 } from './torture/t5-fuzz.mjs';
 import { run as t6 } from './torture/t6-alloc.mjs';
 import { run as t7 } from './torture/t7-soak.mjs';
 import { run as t8 } from './torture/t8-cross.mjs';
@@ -45,6 +48,7 @@ const TIERS = [
     ['T1 degenerate', t1],
     ['T3 adversarial', t3],
     ['T4 handles', t4],
+    ['T5 fuzz', t5],
     ['T6 alloc', t6],
     ['T7 soak', t7],
     ['T8 cross', t8],

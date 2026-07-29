@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-bvh",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Zero-GC dynamic Bounding Volume Hierarchy for 2D. Flat Structure-of-Arrays layout, O(1) free-list allocation, SAH insertion, iterative query — every operation is allocation-free after construction. Companion to @zakkster/lite-aabb.",
   "type": "module",
   "main": "./Bvh.js",

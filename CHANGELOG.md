@@ -3,6 +3,59 @@
 All notable changes to `@zakkster/lite-bvh` are documented here.
 The format follows Keep a Changelog; this package adheres to SemVer.
 
+## [1.2.0] - 2026-07-29
+
+Tree rotations. An adversarial insert order can no longer degrade the tree into
+a linked list, and `query()` no longer allocates on such a tree. Both findings
+had one root cause -- the missing `// TODO: Box2D-style rotations` in `_refit` --
+and both are now closed. See `decisions/0003-rotations-and-query-stack.md`.
+
+### Fixed
+- **B-07** an adversarial (e.g. monotone) insert order no longer degrades the
+  tree. Before, 20,000 wide slabs inserted in sorted order produced a tree of
+  height 19,999 -- a linked list wearing a BVH costume -- and each further insert
+  cost an O(N) refit walk (building that tree took ~2.5 s). `_refit` now applies
+  Box2D-style single rotations, holding height to O(log n): the same build is
+  ~8 ms and height 15. `height` stays `<= 2*ceil(log2(leafCount)) + 2` under
+  every adversarial order in the torture suite.
+- **B-08** `query()` on that degenerate tree grew `queryStack` from 256 to
+  32,768 by allocating INSIDE the traversal loop -- breaking the zero-GC
+  guarantee with data alone, invisibly to a heap-growth gate (the buffers are
+  ArrayBuffer backing stores). With rotations the height is O(log n), the stack
+  needs at most `height + 1` slots, and the fixed 256-slot stack never grows.
+- **remove refit** discovered while implementing rotations: `removeLeaf` refit
+  the parent chain from one level too high, leaving the healed grandparent's
+  height and bbox stale (a superset bbox -- queries stayed correct but
+  over-descended; the stale height was latent). It now refits from the promoted
+  sibling, so the grandparent itself is recomputed. This was invisible pre-B3
+  because rotations are the first consumer of internal heights; a stale height
+  now feeds a wrong rotation decision, so it had to be correct.
+
+### Added
+- Box2D-style `_balance` (a faithful port of `b2DynamicTree::Balance`) in the
+  refit walk, plus a `_combine(dest, a, b)` node-bbox merge helper.
+- `height` (root height in edges; -1 empty, 0 a single leaf) and `leafCount`
+  (O(1): a non-empty tree has `nodeCount === 2*leafCount - 1`) as read-only
+  telemetry, so degradation is observable without `validate()`.
+- Torture tier **T5 (differential fuzz)**: 120k mixed insert/remove/update/query
+  ops against a brute-force O(N) oracle, comparing sorted hit sets -- the
+  executable proof that rotations change the tree's shape, never its answers. T3
+  now asserts the height bound after every adversarial build and mid-drain;
+  T6 gains the B-08 gate (the adversarial tree's query is measured
+  `maxArrayBuffersGrowth: 0` with `queryStack.length` pinned); T9 gains a
+  rotations-disabled control that must trip the height gate.
+
+### Changed
+- `query()` no longer grows its stack. The former silent reallocation is now a
+  fail-closed throw: for a well-formed tree the 256-slot stack is never
+  exhausted (a balanced tree would need ~2^250 nodes), so a throw signals
+  corruption rather than papering over it with an allocation in the hot loop.
+  The bounds check stays -- dropping it would make an overflow a silent
+  typed-array no-op and lose nodes.
+- The `updateLeaf` fast path and the `query` inner loop are otherwise UNCHANGED
+  (zero new instructions). Rotations live in `_refit`, on the insert/remove path
+  only -- never on the fast path, never in a query.
+
 ## [1.1.0] - 2026-07-29
 
 Poison quarantine. A degenerate box can no longer enter the tree and silently
@@ -160,6 +213,7 @@ silent way to corrupt a tree with a plain-looking call:
 - **B-05** `removeLeaf(internalNodeId)` silently destroys the tree.
 - **B-06** `updateLeaf(freedId, ...)` resurrects a removed entity.
 
+[1.2.0]: https://github.com/PeshoVurtoleta/lite-bvh/releases/tag/v1.2.0
 [1.1.0]: https://github.com/PeshoVurtoleta/lite-bvh/releases/tag/v1.1.0
 [1.0.2]: https://github.com/PeshoVurtoleta/lite-bvh/releases/tag/v1.0.2
 [1.0.1]: https://github.com/PeshoVurtoleta/lite-bvh/releases/tag/v1.0.1

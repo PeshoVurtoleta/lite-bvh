@@ -7,14 +7,23 @@
  * the right count.
  *
  * B1 remit: insert orders, remove orders, capacity boundary, teleport churn,
- * finite margins. Height BOUNDS are NOT asserted here -- rotations are B3, so a
- * tall monotone tree is expected and only its CORRECTNESS is gated. Since B2,
- * the margin sweep also asserts that a non-finite margin is rejected atomically;
- * non-finite / inverted LEAF boxes (poison entry) are T8's cross-package tier.
+ * finite margins. Since B2, the margin sweep also asserts that a non-finite
+ * margin is rejected atomically; non-finite / inverted LEAF boxes (poison entry)
+ * are T8's cross-package tier.
+ *
+ * B3 adds the HEIGHT BOUND. With Box2D-style rotations in `_refit`, every insert
+ * order -- including the monotone B-07 shape that produced height 19,999 for
+ * 20,000 leaves -- must keep `height <= 2*ceil(log2(leafCount)) + 2`. Each build
+ * asserts it; the T9 rotations-disabled control proves the assertion can fail.
  */
 
 import { DynamicBVH2D } from '../../Bvh.js';
 import { makePrng, SEED, check, conservation, reachableCount, setBox } from './harness.mjs';
+
+/** The B3 balance guarantee: height stays logarithmic for L leaves. */
+function heightBound(leafCount) {
+    return leafCount < 2 ? 0 : 2 * Math.ceil(Math.log2(leafCount)) + 2;
+}
 
 /** Enclosing query hit count over a fresh out buffer. */
 function countAll(tree, cap) {
@@ -23,13 +32,16 @@ function countAll(tree, cap) {
     return tree.query(q, out);
 }
 
-/** validate() + reachable/nodeCount agreement + enclosing count. */
+/** validate() + reachable/nodeCount agreement + enclosing count + height bound. */
 function assertHealthy(tree, expectedLive, label) {
     tree.validate();
     check(reachableCount(tree) === tree.nodeCount,
         () => `T3.${label}: reachable ${reachableCount(tree)} != nodeCount ${tree.nodeCount}`);
     const got = countAll(tree, tree.maxNodes);
     check(got === expectedLive, () => `T3.${label}: enclosing query ${got} != ${expectedLive}`);
+    const bound = heightBound(tree.leafCount);
+    check(tree.height <= bound,
+        () => `T3.${label}: height ${tree.height} exceeds bound ${bound} for ${tree.leafCount} leaves`);
 }
 
 /** Insert `n` leaves whose boxes come from `boxOf(i)`; return the id array. */
@@ -51,8 +63,10 @@ export function run() {
 
     // --- insert orders -------------------------------------------------------
 
-    // Monotone wide slabs (the B-07 degenerate shape) at two scales.
-    for (const N of [1000, 20000]) {
+    // Monotone wide slabs (the B-07 degenerate shape) at three scales. Without
+    // rotations this produced height N-1 (19,999 at N=20,000); assertHealthy now
+    // pins height <= 2*ceil(log2(N))+2 at each scale.
+    for (const N of [1000, 20000, 100000]) {
         const { tree } = build(N, (i) => B(i, 0, i + 100, 10));
         assertHealthy(tree, N, 'monotone' + N);
     }
@@ -105,7 +119,20 @@ export function run() {
         const { tree, ids } = build(N, (i) => { const x = (i * 37) % 4096, y = (i * 71) % 4096; return B(x, y, x + 3, y + 3); });
         assertHealthy(tree, N, name + '-built');
         const order = orderFn(N);
-        for (let k = 0; k < order.length; k++) tree.removeLeaf(ids[order[k]]);
+        // Validate mid-drain, not just at the empty end: a stale internal height
+        // or bbox left by a remove is invisible once the tree is empty. Every
+        // ~N/8 removes assert full structural health AND the height bound over
+        // the shrinking leaf set (the remove path refits + rebalances too).
+        const step = Math.max(1, N >> 3);
+        for (let k = 0; k < order.length; k++) {
+            tree.removeLeaf(ids[order[k]]);
+            if (k % step === 0 && tree.root !== -1) {
+                tree.validate();
+                const bound = heightBound(tree.leafCount);
+                check(tree.height <= bound,
+                    () => `T3.${name}: mid-drain height ${tree.height} > bound ${bound} at ${tree.leafCount} leaves`);
+            }
+        }
         check(tree.nodeCount === 0, () => `T3.${name}: nodeCount ${tree.nodeCount} != 0 after full drain`);
         check(tree.root === -1, () => `T3.${name}: root != -1 after full drain`);
         check(conservation(tree), () => `T3.${name}: conservation violated after drain`);

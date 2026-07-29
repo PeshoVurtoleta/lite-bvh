@@ -9,10 +9,10 @@
  * Algorithm: Box2D-style dynamic AABB tree (Erin Catto). Insert uses the
  * Surface Area Heuristic; remove heals the gap by promoting the sibling;
  * update has a fast path that does nothing when the tight bounds are still
- * contained inside the fat bounds. No tree-rotation rebalancing yet (see
- * the TODO in `_refit`); for the workloads this is designed for (Twitch
- * extension overlays, particle systems, sprite broadphase) the SAH descent
- * already produces well-balanced trees in practice.
+ * contained inside the fat bounds. The refit walk rebalances with Box2D-style
+ * single rotations (`_balance`), so an adversarial insert order (e.g. a
+ * monotone sweep) can no longer degrade the tree into a linked list -- height
+ * stays O(log n), which is what keeps `query` shallow and allocation-free.
  *
  * Leaf-AABB format: `Float32Array(4)` -> `[minX, minY, maxX, maxY]`,
  * compatible with `@zakkster/lite-aabb`.
@@ -66,7 +66,15 @@ export class DynamicBVH2D {
     root = -1;
 
     // ---- Traversal scratch ----
-    /** Stack reused across all `query()` calls. Auto-grows on overflow. */
+    /**
+     * Stack reused across all `query()` calls. Fixed size, NEVER grows: the
+     * iterative DFS uses at most `height + 1` slots, and with rotations keeping
+     * height at O(log n) the 256 slots here are only exhausted by a tree of
+     * height 255 -- a balanced tree of ~2^250 nodes, far beyond the 2^26 node
+     * cap. Overflow therefore means the tree is more degenerate than rotations
+     * permit, i.e. corruption; `query` throws (fail-closed) rather than silently
+     * allocating a bigger stack inside the hot loop (the old B-08 behaviour).
+     */
     queryStack = new Int32Array(256);
 
     /** Internal scratch AABB for re-insertion fattening. Never exposed. */
@@ -105,6 +113,21 @@ export class DynamicBVH2D {
 
         // Pre-allocated scratch for `updateLeaf` re-inserts (zero-GC).
         this._scratchAABB = new Float32Array(4);
+    }
+
+    /**
+     * Root height in edges: -1 for an empty tree, 0 for a single leaf, else the
+     * longest root-to-leaf path. O(1) telemetry -- with rotations it tracks
+     * ~ceil(log2(leafCount)); watch it to see rebalancing hold under load. */
+    get height() {
+        return this.root === -1 ? -1 : this.heights[this.root];
+    }
+
+    /**
+     * Number of live leaves. O(1): every internal node has exactly two children,
+     * so a non-empty tree has `nodeCount === 2 * leafCount - 1`. */
+    get leafCount() {
+        return this.root === -1 ? 0 : (this.nodeCount + 1) >> 1;
     }
 
     /** Internal O(1) allocation from the free-list. */
@@ -314,6 +337,10 @@ export class DynamicBVH2D {
      *   match your worst-case batch (e.g. visible entities per frame).
      * @returns {number} Hit count. Use `outBuffer.subarray(0, hitCount)` to
      *   read the filled prefix.
+     * @throws Only if the traversal stack overflows -- impossible for a
+     *   well-formed tree (rotations bound height to O(log n), the stack holds
+     *   `height + 1`), so a throw here signals corruption. Fail-closed: it never
+     *   silently grows the stack inside the hot loop (the old B-08 behaviour).
      */
     query(queryAABB, outBuffer) {
         if (this.root === -1) return 0;
@@ -344,12 +371,19 @@ export class DynamicBVH2D {
                     if (hitCount >= maxHits) break;
                     outBuffer[hitCount++] = this.userData[nodeId];
                 } else {
-                    // Safety: auto-grow the stack on pathologically deep trees.
+                    // Fail-closed (B-08): the stack holds at most `height + 1`
+                    // ids, and rotations bound height to O(log n), so this guard
+                    // never trips for a well-formed tree. If it does, the tree is
+                    // corrupt/degenerate beyond what rotations allow -- throw
+                    // loudly rather than silently allocating a bigger stack in the
+                    // hot loop (the old behaviour, which broke the zero-GC law by
+                    // data alone). The check stays: dropping it would make an
+                    // overflow a silent typed-array no-op -> lost nodes -> wrong
+                    // hit counts, which is worse than a throw.
                     if (stackPtr + 2 > stack.length) {
-                        const newStack = new Int32Array(stack.length * 2);
-                        newStack.set(stack);
-                        this.queryStack = newStack;
-                        stack = newStack;
+                        throw new Error('lite-bvh: query stack overflow at depth ' +
+                            stackPtr + ' (stack ' + stack.length + ') -- tree is degenerate; ' +
+                            'call validate()');
                     }
 
                     stack[stackPtr++] = left;
@@ -403,7 +437,13 @@ export class DynamicBVH2D {
             this.parents[sibling] = grandParent;
             this._freeNode(parent);
 
-            this._refit(grandParent);
+            // Refit from `sibling`, whose parent is now grandParent, so the walk
+            // recomputes grandParent ITSELF and up. `_refit(grandParent)` would
+            // start one level too high and leave grandParent's height and bbox
+            // stale after the promotion -- harmless for a bbox (it stays a
+            // superset, so queries only over-descend) but a stale height feeds
+            // `_balance` a wrong rotation decision, so it must be correct here.
+            this._refit(sibling);
         } else {
             // Parent was the root; sibling becomes the new root.
             this.root = sibling;
@@ -499,9 +539,132 @@ export class DynamicBVH2D {
         this.bboxes[d + 3] = Math.max(this.bboxes[s + 3], aabb[3]);
     }
 
+    /** Merge the bboxes of nodes `aId` and `bId` into node `destId`. */
+    _combine(destId, aId, bId) {
+        const d = destId << 2, a = aId << 2, b = bId << 2;
+        this.bboxes[d]     = Math.min(this.bboxes[a],     this.bboxes[b]);
+        this.bboxes[d + 1] = Math.min(this.bboxes[a + 1], this.bboxes[b + 1]);
+        this.bboxes[d + 2] = Math.max(this.bboxes[a + 2], this.bboxes[b + 2]);
+        this.bboxes[d + 3] = Math.max(this.bboxes[a + 3], this.bboxes[b + 3]);
+    }
+
+    /**
+     * One Box2D-style rotation to rebalance the subtree rooted at `iA` (B-07).
+     * A faithful port of Erin Catto's `b2DynamicTree::Balance`: if A's two
+     * subtrees differ in height by more than one, the taller grandchild is
+     * rotated up above A. Returns the (possibly new) subtree root -- `iA`
+     * itself when no rotation was needed -- after fixing every moved node's
+     * parent link, bbox and height. Called once per ancestor by `_refit`, which
+     * keeps the whole tree's height O(log n) regardless of insert order.
+     *
+     * The two branches (rotate C up / rotate B up) are written out in full
+     * rather than folded into a shared helper: this is the insert/remove path,
+     * not the fast path, and staying line-for-line with the reference is worth
+     * more here than brevity.
+     */
+    _balance(iA) {
+        const cA = iA << 1;
+        // A leaf (child1 === -1) or a height-1 node cannot be unbalanced.
+        if (this.children[cA] === -1 || this.heights[iA] < 2) return iA;
+
+        const iB = this.children[cA];
+        const iC = this.children[cA + 1];
+        const balance = this.heights[iC] - this.heights[iB];
+
+        // --- Rotate C up (right child taller) ---
+        if (balance > 1) {
+            const cC = iC << 1;
+            const iF = this.children[cC];
+            const iG = this.children[cC + 1];
+
+            // Swap A and C: C takes A's place, A becomes C's left child.
+            this.children[cC] = iA;
+            this.parents[iC] = this.parents[iA];
+            this.parents[iA] = iC;
+
+            // A's old parent (now C's parent) must point at C.
+            const pC = this.parents[iC];
+            if (pC !== -1) {
+                const cP = pC << 1;
+                if (this.children[cP] === iA) this.children[cP] = iC;
+                else this.children[cP + 1] = iC;
+            } else {
+                this.root = iC;
+            }
+
+            // Promote C's taller grandchild; the other stays under A.
+            if (this.heights[iF] > this.heights[iG]) {
+                this.children[cC + 1] = iF;
+                this.children[cA + 1] = iG;
+                this.parents[iG] = iA;
+                this._combine(iA, iB, iG);
+                this._combine(iC, iA, iF);
+                this.heights[iA] = 1 + Math.max(this.heights[iB], this.heights[iG]);
+                this.heights[iC] = 1 + Math.max(this.heights[iA], this.heights[iF]);
+            } else {
+                this.children[cC + 1] = iG;
+                this.children[cA + 1] = iF;
+                this.parents[iF] = iA;
+                this._combine(iA, iB, iF);
+                this._combine(iC, iA, iG);
+                this.heights[iA] = 1 + Math.max(this.heights[iB], this.heights[iF]);
+                this.heights[iC] = 1 + Math.max(this.heights[iA], this.heights[iG]);
+            }
+            return iC;
+        }
+
+        // --- Rotate B up (left child taller) ---
+        if (balance < -1) {
+            const cB = iB << 1;
+            const iD = this.children[cB];
+            const iE = this.children[cB + 1];
+
+            // Swap A and B: B takes A's place, A becomes B's right child.
+            this.children[cB + 1] = iA;
+            this.parents[iB] = this.parents[iA];
+            this.parents[iA] = iB;
+
+            const pB = this.parents[iB];
+            if (pB !== -1) {
+                const cP = pB << 1;
+                if (this.children[cP] === iA) this.children[cP] = iB;
+                else this.children[cP + 1] = iB;
+            } else {
+                this.root = iB;
+            }
+
+            // Promote B's taller grandchild; the other stays under A.
+            if (this.heights[iD] > this.heights[iE]) {
+                this.children[cB] = iD;
+                this.children[cA] = iE;
+                this.parents[iE] = iA;
+                this._combine(iA, iC, iE);
+                this._combine(iB, iA, iD);
+                this.heights[iA] = 1 + Math.max(this.heights[iC], this.heights[iE]);
+                this.heights[iB] = 1 + Math.max(this.heights[iA], this.heights[iD]);
+            } else {
+                this.children[cB] = iE;
+                this.children[cA] = iD;
+                this.parents[iD] = iA;
+                this._combine(iA, iC, iD);
+                this._combine(iB, iA, iE);
+                this.heights[iA] = 1 + Math.max(this.heights[iC], this.heights[iD]);
+                this.heights[iB] = 1 + Math.max(this.heights[iA], this.heights[iE]);
+            }
+            return iB;
+        }
+
+        return iA;
+    }
+
     _refit(nodeId) {
         let index = this.parents[nodeId];
         while (index !== -1) {
+            // Rebalance first (Box2D order): `_balance` reads the children's
+            // heights -- which are current at this point -- and recomputes the
+            // rotated nodes. `index` may change to the subtree's new root.
+            index = this._balance(index);
+
             const cIdx  = index << 1;
             const left  = this.children[cIdx];
             const right = this.children[cIdx + 1];
@@ -517,7 +680,6 @@ export class DynamicBVH2D {
 
             this.heights[index] = 1 + Math.max(this.heights[left], this.heights[right]);
 
-            // TODO: Box2D-style left/right tree rotations would go here.
             index = this.parents[index];
         }
     }
@@ -629,4 +791,4 @@ export class DynamicBVH2D {
  * `version`, and the top entry of `CHANGELOG.md`. A release that touches one
  * without the other two is a broken release.
  */
-export const VERSION = '1.1.0';
+export const VERSION = '1.2.0';

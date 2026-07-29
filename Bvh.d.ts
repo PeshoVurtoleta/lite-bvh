@@ -40,8 +40,22 @@ export class DynamicBVH2D {
     readonly root: number;
 
     /**
-     * Int32Array traversal stack reused across all `query()` calls. Grows on
-     * pathologically deep trees (see the zero-alloc caveat in the README).
+     * Root height in edges: -1 for an empty tree, 0 for a single leaf, else the
+     * longest root-to-leaf path. O(1). With rotations it tracks
+     * ~ceil(log2(leafCount)); watch it to confirm rebalancing holds under load.
+     */
+    readonly height: number;
+    /**
+     * Number of live leaves. O(1): every internal node has exactly two children,
+     * so a non-empty tree has `nodeCount === 2 * leafCount - 1`.
+     */
+    readonly leafCount: number;
+
+    /**
+     * Int32Array traversal stack reused across all `query()` calls. **Fixed size;
+     * never grows.** The DFS uses at most `height + 1` slots and rotations bound
+     * height to O(log n), so the 256 slots are never exhausted by a well-formed
+     * tree; `query` throws (fail-closed) rather than allocate a bigger one.
      */
     readonly queryStack: Int32Array;
     /** Float32Array(4) internal scratch box for `updateLeaf` re-insert fattening. Never exposed as a result. */
@@ -102,6 +116,10 @@ export class DynamicBVH2D {
      * 0 hits rather than throwing.
      *
      * @returns Hit count. Read the prefix as `outBuffer.subarray(0, hitCount)`.
+     * @throws Only on a traversal-stack overflow, which is impossible for a
+     *   well-formed tree (rotations bound height to O(log n)); a throw here
+     *   signals corruption. It is fail-closed -- `query` never silently grows
+     *   the stack inside the loop.
      */
     query(queryAABB: Float32Array, outBuffer: Int32Array): number;
 
@@ -123,6 +141,14 @@ export class DynamicBVH2D {
      * Internal/test guard.
      */
     _isValidBox(a: ArrayLike<number>): boolean;
+
+    /**
+     * One Box2D-style rotation to rebalance the subtree at `iA`; returns the
+     * (possibly new) subtree root. Called by the refit walk. Internal -- exposed
+     * only so a control can disable rotations (assign the identity) and prove the
+     * height gate can fail.
+     */
+    _balance(iA: number): number;
 }
 
 /** Package version. In three-place sync with `package.json` and `CHANGELOG.md`. */
