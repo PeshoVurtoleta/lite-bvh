@@ -84,6 +84,26 @@ export class DynamicBVH2D {
     insertLeaf(leafAABB: Float32Array, data: number): number;
 
     /**
+     * Bulk insert of `count` boxes packed contiguously in one `Float32Array`
+     * (`4*count` floats, box `i` at slots `4i..4i+3` -- the FORMAT.md packed
+     * layout). Reads the buffer by index, so it allocates nothing per box.
+     *
+     * **Batch-atomic**: every box, every `data`, the buffer-alias rule and total
+     * capacity are validated BEFORE any mutation. A single bad element throws and
+     * leaves the tree byte-unchanged -- never a partial batch. The per-box test is
+     * exactly `insertLeaf`'s door.
+     *
+     * @param packed `4*count` floats; box `i` at `[4i, 4i+3]`.
+     * @param dataArray `count` userData ints (each a non-negative int32).
+     * @param count Number of boxes to insert.
+     * @returns `count` (all boxes inserted, or the call threw).
+     * @throws Before any mutation on a bad `count`; a `packed`/`dataArray` too
+     *   short; a `packed` aliasing the tree's own `bboxes`; a non-finite or
+     *   inverted box; a bad `data`; or insufficient capacity.
+     */
+    insertLeaves(packed: Float32Array, dataArray: ArrayLike<number>, count: number): number;
+
+    /**
      * Empties the tree to its just-constructed state WITHOUT reallocating any
      * buffer -- for scene reloads and reset-in-place loops. **O(maxNodes)**, not
      * a hot-path call. Fails closed: every liveness marker is reset, so a leaf
@@ -206,3 +226,12 @@ export class DynamicBVH2D {
 
 /** Package version. In three-place sync with `package.json` and `CHANGELOG.md`. */
 export const VERSION: string;
+
+/**
+ * Version of the shared FORMAT contract (see FORMAT.md), NOT the package version.
+ * `@zakkster/lite-aabb` exports the identical constant; the two are compared for
+ * equality to detect a format skew. On a separate axis from `VERSION` -- it bumps
+ * only when the buffer layout itself changes. Copied inline (no runtime dep on
+ * lite-aabb); agreement is enforced by the conformance test.
+ */
+export const FORMAT_VERSION: number;

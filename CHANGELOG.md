@@ -3,6 +3,48 @@
 All notable changes to `@zakkster/lite-bvh` are documented here.
 The format follows Keep a Changelog; this package adheres to SemVer.
 
+## [2.0.0] - 2026-07-30
+
+The twin major with `@zakkster/lite-aabb@2.0.0`: the shared buffer format becomes
+a versioned, cross-package contract, and a packed bulk-insert entry point lands.
+Every v1 method is unchanged and still exported -- the major marks the formalized
+FORMAT contract, not a code break. See `decisions/0005-format-contract.md` and
+`FORMAT.md`.
+
+### Added
+- **`FORMAT.md` + `FORMAT_VERSION` (= 1)** -- the shared, versioned buffer
+  contract, byte-identical in both packages. `FORMAT_VERSION` is an integer
+  compared for equality, on a **separate axis** from the semver `VERSION`; it is
+  copied inline (no runtime dependency on `@zakkster/lite-aabb`), and the two
+  packages' agreement is enforced by a conformance test, not a dependency edge.
+- **`insertLeaves(packed, dataArray, count)`** -- bulk insert of `count` boxes
+  from one packed `Float32Array` (`4*count` floats, box `i` at `[4i, 4i+3]`). The
+  broadphase-feeding path: reads the buffer by index, so it allocates **nothing
+  per box** (no `subarray`). **Batch-atomic** -- every box, every `data`, the
+  alias rule and total capacity are validated before any mutation, so a single
+  bad element throws and leaves the tree byte-unchanged (never a partial batch).
+- Cross-package round-trip conformance: build a packed buffer with
+  `aabb2.fattenAll`, feed it straight to `insertLeaves`, and confirm
+  `query`/`queryPoint`/`raycast` agree with a brute-force scan over the same
+  geometry (unit test + torture T8). T5 fuzz gains a bulk-vs-single differential;
+  T6 gates `insertLeaves` at `maxArrayBuffersGrowth: 0`; T9 adds a batch-atomic
+  control.
+
+### Changed
+- **BREAKING (contract):** `FORMAT_VERSION` is now the versioned handshake between
+  the two packages. A consumer that mixes `@zakkster/lite-bvh@2` with an older
+  `@zakkster/lite-aabb` should assert the two `FORMAT_VERSION` values are equal.
+  The `Float32Array(4)` `[minX, minY, maxX, maxY]` **layout is unchanged**
+  (`FORMAT_VERSION` stays 1); no data buffer needs migrating.
+- `insertLeaf`'s post-validation body was factored into an internal
+  `_insertPreValidated` shared with `insertLeaves`. `insertLeaf`'s observable
+  behaviour (including B-11 coercion) is **unchanged**, measured within noise.
+
+### Notes
+- Zero runtime dependencies unchanged; `@zakkster/lite-aabb` is a devDependency
+  only, bumped to `^2.0.0` for the round-trip conformance test.
+- No new query kinds; `closestPoint` remains deferred (decision 0004).
+
 ## [1.3.0] - 2026-07-29
 
 New query kinds, on the now-sound structure (B-13). Point-pick and segment

@@ -134,4 +134,42 @@ export function run() {
                 ' source=' + advSummary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
         }
     }
+
+    // --- X1: bulk insert must not allocate per box ---------------------------
+    // `insertLeaves` walks a packed 4*N buffer by index and copies each box into a
+    // reused scratch -- no per-box `subarray`. The hot body clears and refills the
+    // tree from a pre-built packed buffer every iteration; a per-box view (or any
+    // batch bookkeeping) would show as arrayBuffers growth under the deep gate.
+    {
+        const B = 256;
+        const packed = new Float32Array(4 * B);
+        const bdata = new Int32Array(B);
+        for (let i = 0; i < B; i++) {
+            const x = (i * 131) % 4096, y = (i * 257) % 4096;
+            packed[4 * i] = x - 4; packed[4 * i + 1] = y - 4;
+            packed[4 * i + 2] = x + 4; packed[4 * i + 3] = y + 4;
+            bdata[i] = i;
+        }
+        const bulk = new DynamicBVH2D(4 * B + 8);
+
+        const bulkHot = () => {
+            bulk.clear();
+            bulk.insertLeaves(packed, bdata, B);
+        };
+
+        const bulkStackBefore = bulk.queryStack.length;
+        const bulkBboxBefore = bulk.bboxes.buffer.byteLength;
+        const { report: bulkReport, summary: bulkSummary } =
+            runOpsGate(bulkHot, { ops: 3000, warmup: 200 });
+
+        check(bulk.queryStack.length === bulkStackBefore,
+            () => `T6: bulk queryStack grew ${bulkStackBefore} -> ${bulk.queryStack.length}`);
+        check(bulk.bboxes.buffer.byteLength === bulkBboxBefore,
+            () => `T6: bulk bboxes backing store grew ${bulkBboxBefore} -> ${bulk.bboxes.buffer.byteLength}`);
+        if (!bulkReport.ok) {
+            const g = bulkSummary.gc;
+            die('T6 bulk-insert alloc gate rejected -- verdict=' + bulkReport.verdict +
+                ' source=' + bulkSummary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+        }
+    }
 }

@@ -211,4 +211,46 @@ export function run() {
     }
 
     tree.validate();
+
+    // --- X1 bulk path: insertLeaves must equal N single insertLeaf calls -----
+    // insertLeaves returns a count, not ids, so it cannot drive the handle-tracking
+    // oracle above; prove it differentially instead. The SAME random geometry in
+    // the SAME order, inserted single vs bulk, must produce identical hit sets for
+    // many random queries. (They build byte-identical trees -- that is the point:
+    // the bulk path must not misorder, drop, or corrupt a box.)
+    {
+        const M = 200;
+        const packed = new Float32Array(4 * M);
+        const bdata = new Int32Array(M);
+        for (let i = 0; i < M; i++) {
+            const x = rnd(WORLD), y = rnd(WORLD);
+            const w = 1 + rnd(20), h = 1 + rnd(20);
+            packed[4 * i] = x; packed[4 * i + 1] = y; packed[4 * i + 2] = x + w; packed[4 * i + 3] = y + h;
+            bdata[i] = i;
+        }
+
+        const single = new DynamicBVH2D(4 * M + 8);
+        for (let i = 0; i < M; i++) {
+            single.insertLeaf(setBox(box, packed[4 * i], packed[4 * i + 1], packed[4 * i + 2], packed[4 * i + 3]), i);
+        }
+        const bulk = new DynamicBVH2D(4 * M + 8);
+        check(bulk.insertLeaves(packed, bdata, M) === M, () => `T5 bulk: insertLeaves count != ${M} (seed ${SEED})`);
+        single.validate();
+        bulk.validate();
+        check(bulk.leafCount === M, () => `T5 bulk: leafCount ${bulk.leafCount} != ${M}`);
+
+        const sOut = new Int32Array(M), bOut = new Int32Array(M);
+        for (let t = 0; t < 300; t++) {
+            const qx = rnd(WORLD), qy = rnd(WORLD);
+            const qx1 = qx + rnd(300), qy1 = qy + rnd(300);
+            const sn = single.query(setBox(box, qx, qy, qx1, qy1), sOut);
+            const bn = bulk.query(setBox(tight, qx, qy, qx1, qy1), bOut);
+            check(sn === bn, () => `T5 bulk: query ${t} single ${sn} != bulk ${bn} hits (seed ${SEED})`);
+            const s = stamp++;
+            for (let i = 0; i < bn; i++) seen[bOut[i]] = s;
+            for (let i = 0; i < sn; i++) {
+                check(seen[sOut[i]] === s, () => `T5 bulk: query ${t} hit-set divergence (seed ${SEED})`);
+            }
+        }
+    }
 }

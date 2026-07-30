@@ -134,4 +134,26 @@ export function run() {
     if (conv.queryPoint(10.01, 5, o) !== 0) die('T9 control: queryPoint hit a just-outside point (comparator blind)');
     if (conv.raycast(0, -5, 0, 15, o) !== 1) die('T9 control: raycast missed an edge-grazing segment');
     if (conv.raycast(-0.01, -5, -0.01, 15, o) !== 0) die('T9 control: raycast hit a just-outside segment (comparator blind)');
+
+    // Control 9 -- the X1 batch-atomic guarantee. `insertLeaves` must leave the
+    // tree byte-unchanged when ANY element is bad. Prove it AND prove it is not
+    // vacuous: a batch with a mid-stream NaN box is rejected with nodeCount
+    // unchanged, while the same-shaped all-valid batch DOES mutate the tree (so
+    // the "unchanged" assertion is a real property, not a tree that never grows).
+    const ba = new DynamicBVH2D(64);
+    ba.insertLeaf(setBox(new Float32Array(4), 0, 0, 1, 1), 0);
+    const nc = ba.nodeCount;
+    let threwBatch = false;
+    try {
+        ba.insertLeaves(Float32Array.of(2, 2, 3, 3, NaN, 0, 1, 1, 4, 4, 5, 5), Int32Array.of(1, 2, 3), 3);
+    } catch { threwBatch = true; }
+    if (!threwBatch) die('T9 control: insertLeaves accepted a batch containing a NaN box');
+    if (ba.nodeCount !== nc) {
+        die('T9 control: a rejected insertLeaves batch mutated the tree -- not batch-atomic');
+    }
+    ba.insertLeaves(Float32Array.of(2, 2, 3, 3, 4, 4, 5, 5), Int32Array.of(1, 2), 2);
+    if (ba.nodeCount === nc) {
+        die('T9 control: a valid insertLeaves batch did not change nodeCount -- the atomicity control is vacuous');
+    }
+    ba.validate();
 }

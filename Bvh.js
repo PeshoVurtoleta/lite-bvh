@@ -80,6 +80,10 @@ export class DynamicBVH2D {
     /** Internal scratch AABB for re-insertion fattening. Never exposed. */
     _scratchAABB;
 
+    /** Internal scratch box for `insertLeaves` to copy each packed box into,
+     *  so the bulk path allocates no per-box view. Never exposed. */
+    _batchScratch;
+
     /**
      * @param {number} maxNodes Hard cap on total nodes (leaves + internal). Internal
      *   nodes are needed too — for N leaves you'll create at most 2N-1 total nodes,
@@ -113,6 +117,8 @@ export class DynamicBVH2D {
 
         // Pre-allocated scratch for `updateLeaf` re-inserts (zero-GC).
         this._scratchAABB = new Float32Array(4);
+        // Pre-allocated scratch for `insertLeaves` per-box copy (zero-GC).
+        this._batchScratch = new Float32Array(4);
     }
 
     /**
@@ -270,6 +276,91 @@ export class DynamicBVH2D {
             throw new Error('lite-bvh: insertLeaf leafAABB must not alias the tree bboxes buffer');
         }
 
+        return this._insertPreValidated(leafAABB, data);
+    }
+
+    /**
+     * Bulk insert of `count` boxes packed contiguously in one `Float32Array`
+     * (`4*count` floats, box `i` at slots `4i..4i+3` -- the FORMAT.md packed
+     * layout). The broadphase-feeding path: it reads the buffer BY INDEX, so it
+     * allocates NOTHING per box (a `subarray` per box would defeat the point and
+     * fail the T6 gate).
+     *
+     * **Batch-atomic** (fail closed): every box, every `data`, the buffer-alias
+     * rule and total capacity are checked in a single pass BEFORE any mutation.
+     * If any element is bad the call throws and the tree is left byte-unchanged --
+     * never a partial batch. The per-box test is exactly `insertLeaf`'s door
+     * (finite/non-inverted box; non-negative int32 `data`; no `bboxes` aliasing).
+     *
+     * @param {Float32Array} packed `4*count` floats; box `i` at `[4i, 4i+3]`.
+     * @param {ArrayLike<number>} dataArray `count` userData ints, one per box.
+     * @param {number} count Number of boxes to insert.
+     * @returns {number} `count` (all boxes inserted, or the call threw).
+     * @throws Before any mutation on: a non-integer/negative `count`; a `packed`
+     *   or `dataArray` too short; a `packed` aliasing the tree's own `bboxes`; a
+     *   non-finite or inverted box; a bad `data`; or insufficient capacity.
+     */
+    insertLeaves(packed, dataArray, count) {
+        if ((count | 0) !== count || count < 0) {
+            throw new Error('lite-bvh: insertLeaves count must be a non-negative int32, got ' + count);
+        }
+        if (count === 0) return 0;
+        if (packed.length < (count << 2)) {
+            throw new Error('lite-bvh: insertLeaves packed buffer holds fewer than 4*count floats');
+        }
+        if (dataArray.length < count) {
+            throw new Error('lite-bvh: insertLeaves dataArray holds fewer than count entries');
+        }
+        // B-12 at the batch level: the packed buffer must not be a view into the
+        // tree's own bboxes (the SAH descent reads it while _refit writes it).
+        if (packed.buffer === this.bboxes.buffer) {
+            throw new Error('lite-bvh: insertLeaves packed must not alias the tree bboxes buffer');
+        }
+        // Whole-batch capacity, up front: `count` leaves add at most `2*count`
+        // nodes (each leaf may create an internal parent; the first into an empty
+        // tree adds only one). Conservative by <=1 -- fail closed, no free-list walk.
+        if (this.nodeCount + (count << 1) > this.maxNodes) {
+            throw new Error('lite-bvh: insertLeaves needs up to ' + (count << 1) +
+                ' free nodes; capacity ' + this.maxNodes + ' would be exceeded');
+        }
+        // Per-element quarantine, still BEFORE any mutation (batch-atomic): a
+        // single bad box or data value aborts with the tree untouched. Inlined
+        // `_isValidBox` on the packed slots so no per-box view is created.
+        for (let k = 0, j = 0; k < count; k++, j += 4) {
+            if (!(Number.isFinite(packed[j]) && Number.isFinite(packed[j + 1]) &&
+                  Number.isFinite(packed[j + 2]) && Number.isFinite(packed[j + 3]) &&
+                  packed[j] <= packed[j + 2] && packed[j + 1] <= packed[j + 3])) {
+                throw new Error('lite-bvh: insertLeaves rejected a non-finite or inverted box at index ' + k);
+            }
+            const d = dataArray[k];
+            if ((d | 0) !== d || d < 0) {
+                throw new Error('lite-bvh: insertLeaves userData must be a non-negative int32 at index ' +
+                    k + ', got ' + d);
+            }
+        }
+        // All validated: insert. Copy each box into the reused scratch (zero
+        // per-box allocation) and hand it to the shared, already-validated core.
+        const s = this._batchScratch;
+        for (let k = 0, j = 0; k < count; k++, j += 4) {
+            s[0] = packed[j]; s[1] = packed[j + 1]; s[2] = packed[j + 2]; s[3] = packed[j + 3];
+            this._insertPreValidated(s, dataArray[k]);
+        }
+        return count;
+    }
+
+    /**
+     * Inserts a box that has ALREADY cleared the quarantine door and the
+     * userData / alias checks. Shared by `insertLeaf` (single) and `insertLeaves`
+     * (bulk) so the SAH descent + refit live in one place. `box4` is read by
+     * index `[0..3]` -- the caller's `Float32Array` on the single path, the reused
+     * `_batchScratch` on the bulk path. Still does its own atomic capacity check
+     * (a redundant no-op when the bulk caller pre-reserved).
+     *
+     * @param {ArrayLike<number>} box4
+     * @param {number} data
+     * @returns {number} the new leaf id
+     */
+    _insertPreValidated(box4, data) {
         // B-01: reserve capacity atomically, BEFORE the first mutation. A
         // non-empty tree needs two free nodes (the leaf plus a new internal
         // parent); an empty tree needs one. Checking up front means a capacity
@@ -287,10 +378,10 @@ export class DynamicBVH2D {
         const leaf = this._allocateNode();
 
         const bIdx = leaf << 2;
-        this.bboxes[bIdx]     = leafAABB[0];
-        this.bboxes[bIdx + 1] = leafAABB[1];
-        this.bboxes[bIdx + 2] = leafAABB[2];
-        this.bboxes[bIdx + 3] = leafAABB[3];
+        this.bboxes[bIdx]     = box4[0];
+        this.bboxes[bIdx + 1] = box4[1];
+        this.bboxes[bIdx + 2] = box4[2];
+        this.bboxes[bIdx + 3] = box4[3];
         this.userData[leaf] = data;
 
         if (this.root === -1) {
@@ -306,27 +397,27 @@ export class DynamicBVH2D {
             const right = this.children[(searchNode << 1) + 1];
 
             const nodeArea = this._perimeterNode(searchNode);
-            const combinedArea = this._mergedPerimeter(searchNode, leafAABB);
+            const combinedArea = this._mergedPerimeter(searchNode, box4);
             const cost = 2.0 * combinedArea;
             const inheritanceCost = 2.0 * (combinedArea - nodeArea);
 
             // Descent cost for left child.
             let costLeft;
             if (this.children[left << 1] === -1) {
-                costLeft = this._mergedPerimeter(left, leafAABB) + inheritanceCost;
+                costLeft = this._mergedPerimeter(left, box4) + inheritanceCost;
             } else {
                 const oldArea = this._perimeterNode(left);
-                const newArea = this._mergedPerimeter(left, leafAABB);
+                const newArea = this._mergedPerimeter(left, box4);
                 costLeft = (newArea - oldArea) + inheritanceCost;
             }
 
             // Descent cost for right child.
             let costRight;
             if (this.children[right << 1] === -1) {
-                costRight = this._mergedPerimeter(right, leafAABB) + inheritanceCost;
+                costRight = this._mergedPerimeter(right, box4) + inheritanceCost;
             } else {
                 const oldArea = this._perimeterNode(right);
-                const newArea = this._mergedPerimeter(right, leafAABB);
+                const newArea = this._mergedPerimeter(right, box4);
                 costRight = (newArea - oldArea) + inheritanceCost;
             }
 
@@ -344,7 +435,7 @@ export class DynamicBVH2D {
         this.parents[newParent] = oldParent;
         this.userData[newParent] = -1; // internal nodes carry no user data
 
-        this._mergeNodesToAABB(newParent, sibling, leafAABB);
+        this._mergeNodesToAABB(newParent, sibling, box4);
         this.heights[newParent] = this.heights[sibling] + 1;
 
         if (oldParent !== -1) {
@@ -1017,4 +1108,15 @@ export class DynamicBVH2D {
  * `version`, and the top entry of `CHANGELOG.md`. A release that touches one
  * without the other two is a broken release.
  */
-export const VERSION = '1.3.0';
+export const VERSION = '2.0.0';
+
+/**
+ * The version of the shared FORMAT contract (see FORMAT.md), NOT the package
+ * version. `@zakkster/lite-aabb` exports the identical constant; the two packages
+ * compare it for equality to detect a format skew. It is an integer compared for
+ * equality, on a separate axis from `VERSION` -- do not sync it to semver. Copied
+ * inline (not imported) so this package keeps zero runtime dependencies; the two
+ * are held in agreement by the conformance test, not by a dependency edge.
+ * Bumps only when the buffer layout itself changes (decisions/0005). (v2.0.0+)
+ */
+export const FORMAT_VERSION = 1;

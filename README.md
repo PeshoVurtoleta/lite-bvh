@@ -273,6 +273,7 @@ A tree holding `N` leaves uses at most `2N - 1` total nodes (when fully populate
 | Method | Returns | Description |
 |---|---|---|
 | `insertLeaf(leafAABB, data)` | `number` (node id) | Inserts a leaf. **Store the returned id.** `data` must be a non-negative int32. **Throws** — atomically, before any mutation — at capacity, on a non-finite or inverted box, on a bad `data`, or on a box aliasing the tree's own `bboxes`. |
+| `insertLeaves(packed, dataArray, count)` | `number` (`count`) | Bulk insert of `count` boxes from one packed `Float32Array` (`4×count` floats, box `i` at `[4i, 4i+3]` — the [FORMAT.md](FORMAT.md) packed layout, and what `@zakkster/lite-aabb`'s `fattenAll`/`mergeAll` produce). Reads by index — **zero per-box allocation**. **Batch-atomic**: validates every box, `data`, alias, and capacity before any mutation, so a single bad element **throws with the tree byte-unchanged** (never a partial batch). |
 | `removeLeaf(leaf)` | `void` | Removes a leaf, heals the gap, returns nodes to the free list. **Throws** on an invalid, freed, or non-leaf (internal) handle. |
 | `updateLeaf(leaf, newAABB, margin)` | `number` (node id) | Fast path: returns `leaf` unchanged if still contained. Slow path: removes, fattens by `margin`, re-inserts; returns a (possibly new) id. **Throws** on an invalid/freed handle, or (slow path, atomically) when the fattened box is non-finite or inverted. **Always reassign your stored handle from the return value.** |
 | `query(queryAABB, outBuffer)` | `number` (hit count) | Writes intersecting leaves' `userData` into `outBuffer`. Stops early when the buffer fills; a zero-length buffer returns `0`. Read-only — takes no quarantine door, so a non-finite or empty-sentinel query box returns `0` rather than throwing. Never allocates (the fixed traversal stack throws fail-closed on the impossible overflow rather than growing). |
@@ -285,6 +286,8 @@ A tree holding `N` leaves uses at most `2N - 1` total nodes (when fully populate
 ### Conventions
 
 - **AABB format:** `Float32Array` of length 4, `[minX, minY, maxX, maxY]`. Identical to `@zakkster/lite-aabb` format. A box must be finite and non-inverted (`minX <= maxX`, `minY <= maxY`) to enter the tree. A plain `Array`/`Float64Array` is accepted and coerced to f32, but pass a `Float32Array` — the `updateLeaf` fast path compares against f32-rounded bounds, so a `Float64Array` within one f32 ulp of the fat boundary can slip the fast path (a silent miss).
+- **FORMAT contract:** the exact shared layout (single box, packed `4×N`, touching-edge, aliasing, margin floor) is pinned in [FORMAT.md](FORMAT.md), byte-identical with `@zakkster/lite-aabb`. Both packages export `FORMAT_VERSION` (an integer, currently `1`, on a separate axis from the semver `VERSION`); assert them equal when mixing versions of the two. It is copied inline here — no runtime dependency.
+- **Packed `4×N`:** N boxes in one `Float32Array`, box `i` at slots `4i..4i+3`. What `insertLeaves` consumes and what `@zakkster/lite-aabb`'s `fattenAll`/`mergeAll` produce.
 - **`userData`:** a **non-negative int32** (`[0, 2^31-1]`). `-1` is reserved as the internal-node sentinel; `2**31` and `3.7` (which would wrap/truncate) are rejected at the door.
 - **`outBuffer`:** caller-owned `Int32Array`. The library never holds a reference past the call.
 
@@ -342,21 +345,22 @@ npm run verify   # both, in order
 | Remove | only leaf, sibling promotion, unfindability, capacity reusability |
 | Update | fast path (same id), slow path (new id), user-data preservation, margin correctness |
 | Clear & bounds | `clear()` reuses buffers, fails closed on stale handles, rebuilds identically; `getBounds` f32-exact round-trip |
+| Bulk & format | `insertLeaves` ≡ N single inserts, batch-atomic reject, capacity/shape guards; `FORMAT_VERSION` agrees with `@zakkster/lite-aabb`; `aabb2.fattenAll` → `insertLeaves` → query round-trip |
 | Telemetry & rotations | `height`/`leafCount` accessors; monotone insert stays height-bounded |
 | Regressions | every S1/S2 finding (B-01…B-13, A-05) has a named before/after test |
 
-The **zero-allocation guarantee is not a heap-growth heuristic.** It is gated by the torture suite (tier T6) at `maxArrayBuffersGrowth: 0` with `stabilize: 'deep'`, plus a direct `queryStack.length` / `bboxes.buffer.byteLength` assertion — because the tree's buffers live in ArrayBuffer backing stores *outside* the V8 heap, where a heap-growth gate is blind. T6 gates all three query kinds (`query`, `queryPoint`, `raycast`), which share the one fixed stack. Tier T5 (differential fuzz against a brute-force O(N) oracle) fuzzes all three kinds against independent oracles — proving rotations change the tree's shape but never its answers; tier T8 proves cross-package agreement with `@zakkster/lite-aabb`. `node --expose-gc test/torture.mjs` prints exactly `ok`.
+The **zero-allocation guarantee is not a heap-growth heuristic.** It is gated by the torture suite (tier T6) at `maxArrayBuffersGrowth: 0` with `stabilize: 'deep'`, plus a direct `queryStack.length` / `bboxes.buffer.byteLength` assertion — because the tree's buffers live in ArrayBuffer backing stores *outside* the V8 heap, where a heap-growth gate is blind. T6 gates all three query kinds (`query`, `queryPoint`, `raycast`) and the packed `insertLeaves` bulk path. Tier T5 (differential fuzz against a brute-force O(N) oracle) fuzzes all three query kinds against independent oracles — plus a bulk-vs-single differential — proving rotations change the tree's shape but never its answers; tier T8 proves cross-package agreement with `@zakkster/lite-aabb`, including the `FORMAT_VERSION` handshake and the packed round-trip. `node --expose-gc test/torture.mjs` prints exactly `ok`.
 
 ---
 
 ## Limitations & roadmap
 
-`queryPoint` and `raycast` shipped in v1.3.0, alongside `clear()` and `getBounds()`. What's left:
+`queryPoint`/`raycast`/`clear()`/`getBounds()` shipped in v1.3.0; the packed batch ops and the shared FORMAT contract shipped in v2.0.0. Only one item remains deferred:
 
 | Feature | Why | Status |
 |---|---|---|
 | **`closestPoint(p, outBuffer)`** | Nearest-leaf to a point with optional max-distance cap. | **Deferred** — needs a best-first traversal ordered by distance, i.e. a priority queue: a second data structure with its own zero-allocation proof (a pre-allocated binary heap). Shipping it means allocating per query or proving a heap zero-alloc; that is its own session, not a footnote. See [decision 0004](decisions/0004-query-kinds.md). |
-| **Packed batch ops** (`insertLeaves`, packed `4×N` feed) | Broadphase feeding without a per-box view. | Planned for the twin 2.0.0 format contract (shared with `@zakkster/lite-aabb`). |
+| **Packed batch ops** (`insertLeaves`, packed `4×N` feed) | Broadphase feeding without a per-box view. | **Shipped in 2.0.0** — `insertLeaves`, plus the shared [FORMAT.md](FORMAT.md) contract / `FORMAT_VERSION`, twinned with `@zakkster/lite-aabb@2.0.0`'s `fattenAll`/`mergeAll`/`intersectsAny`. |
 
 > **Note on `raycast`.** It takes scalar endpoints and writes hits into a caller buffer — **not** the `raycast(p0, p1, callback)` form an earlier roadmap sketched. A per-hit callback re-enters user code mid-traversal while the shared query stack is held, so a nested query from that callback would corrupt it. Iterate the returned prefix instead.
 

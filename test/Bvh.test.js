@@ -16,7 +16,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { DynamicBVH2D, VERSION } from '../Bvh.js';
+import { DynamicBVH2D, VERSION, FORMAT_VERSION } from '../Bvh.js';
+import { aabb2, FORMAT_VERSION as AABB_FORMAT_VERSION } from '@zakkster/lite-aabb';
 
 function box(minX, minY, maxX, maxY) {
     const b = new Float32Array(4);
@@ -41,7 +42,13 @@ function queryIds(tree, query, max = 1024) {
 // =============================================================================
 
 test('VERSION is exported and in three-place sync', () => {
-    assert.equal(VERSION, '1.3.0');
+    assert.equal(VERSION, '2.0.0');
+});
+
+test('FORMAT_VERSION is exported and agrees with @zakkster/lite-aabb', () => {
+    assert.equal(FORMAT_VERSION, 1, 'FORMAT contract version is 1');
+    assert.equal(FORMAT_VERSION, AABB_FORMAT_VERSION,
+        'the two packages must agree on the shared FORMAT contract');
 });
 
 // =============================================================================
@@ -542,6 +549,134 @@ test('queryPoint / raycast respect outBuffer capacity and stop early', () => {
     // Zero-length buffer records nothing.
     assert.equal(tree.queryPoint(5, 5, new Int32Array(0)), 0);
     assert.equal(tree.raycast(-1, 5, 11, 5, new Int32Array(0)), 0);
+});
+
+// =============================================================================
+// BULK INSERT + FORMAT ROUND-TRIP (X1: v2.0.0)
+// =============================================================================
+
+test('insertLeaves matches N single insertLeaf calls exactly', () => {
+    const N = 60;
+    const packed = new Float32Array(4 * N);
+    const data = new Int32Array(N);
+    for (let i = 0; i < N; i++) {
+        const x = (i * 37) % 500, y = (i * 71) % 500;
+        packed[4 * i] = x; packed[4 * i + 1] = y; packed[4 * i + 2] = x + 4; packed[4 * i + 3] = y + 4;
+        data[i] = i;
+    }
+
+    const single = new DynamicBVH2D(4 * N + 8);
+    for (let i = 0; i < N; i++) {
+        single.insertLeaf(box(packed[4 * i], packed[4 * i + 1], packed[4 * i + 2], packed[4 * i + 3]), i);
+    }
+    const bulk = new DynamicBVH2D(4 * N + 8);
+    assert.equal(bulk.insertLeaves(packed, data, N), N);
+
+    single.validate();
+    bulk.validate();
+    assert.equal(bulk.leafCount, N);
+    // Same geometry inserted in the same order -> identical hit sets.
+    const q = box(-1, -1, 1000, 1000);
+    assert.deepEqual(queryIds(bulk, q), queryIds(single, q));
+});
+
+test('insertLeaves handles count 0, 1, 2', () => {
+    const tree = new DynamicBVH2D(32);
+    assert.equal(tree.insertLeaves(new Float32Array(0), new Int32Array(0), 0), 0);
+    assert.equal(tree.root, -1, 'count 0 leaves the tree empty');
+
+    assert.equal(tree.insertLeaves(Float32Array.of(0, 0, 1, 1), Int32Array.of(5), 1), 1);
+    assert.equal(tree.leafCount, 1);
+    assert.equal(tree.userData[tree.root], 5);
+
+    tree.clear();
+    assert.equal(tree.insertLeaves(Float32Array.of(0, 0, 1, 1, 10, 10, 11, 11), Int32Array.of(1, 2), 2), 2);
+    assert.equal(tree.leafCount, 2);
+    tree.validate();
+});
+
+test('insertLeaves is batch-atomic: a bad element leaves the tree byte-unchanged', () => {
+    const tree = new DynamicBVH2D(64);
+    tree.insertLeaf(box(0, 0, 1, 1), 100);
+    const nodeCountBefore = tree.nodeCount;
+    const rootBefore = tree.root;
+
+    // Bad box in the middle.
+    assert.throws(
+        () => tree.insertLeaves(Float32Array.of(0, 0, 1, 1, NaN, 0, 1, 1, 2, 2, 3, 3), Int32Array.of(1, 2, 3), 3),
+        /non-finite or inverted box at index 1/);
+    // Bad data in the middle.
+    assert.throws(
+        () => tree.insertLeaves(Float32Array.of(0, 0, 1, 1, 2, 2, 3, 3), Int32Array.of(1, -7), 2),
+        /non-negative int32 at index 1/);
+    // Inverted box.
+    assert.throws(
+        () => tree.insertLeaves(Float32Array.of(5, 5, 4, 4), Int32Array.of(1), 1),
+        /non-finite or inverted box at index 0/);
+
+    assert.equal(tree.nodeCount, nodeCountBefore, 'a rejected batch mutated the tree');
+    assert.equal(tree.root, rootBefore);
+    tree.validate();
+});
+
+test('insertLeaves validates batch shape, capacity, and self-aliasing', () => {
+    const tree = new DynamicBVH2D(8);
+    // count must be a non-negative int.
+    assert.throws(() => tree.insertLeaves(new Float32Array(4), new Int32Array(1), -1), /count must be/);
+    assert.throws(() => tree.insertLeaves(new Float32Array(4), new Int32Array(1), 1.5), /count must be/);
+    // buffers too short.
+    assert.throws(() => tree.insertLeaves(new Float32Array(4), new Int32Array(1), 2), /fewer than 4\*count/);
+    assert.throws(() => tree.insertLeaves(new Float32Array(8), new Int32Array(1), 2), /fewer than count/);
+    // capacity: 8 nodes can't take 8 leaves (needs up to 16 nodes).
+    assert.throws(() => tree.insertLeaves(new Float32Array(32), new Int32Array(8), 8), /capacity/);
+    // a view into the tree's own bboxes is forbidden.
+    tree.insertLeaf(box(0, 0, 1, 1), 0);
+    const aliased = tree.bboxes.subarray(0, 4);
+    assert.throws(() => tree.insertLeaves(aliased, Int32Array.of(1), 1), /alias the tree bboxes buffer/);
+});
+
+test('FORMAT round-trip: aabb2.fattenAll -> insertLeaves -> query/queryPoint/raycast', () => {
+    // The cross-package conformance test, run from THIS repo: build boxes with
+    // @zakkster/lite-aabb's batch op, feed the packed buffer straight to the bvh,
+    // and assert the tree agrees with a brute-force scan over the fattened boxes.
+    const N = 40;
+    const tight = new Float32Array(4 * N);
+    const fat = new Float32Array(4 * N);
+    const data = new Int32Array(N);
+    for (let i = 0; i < N; i++) {
+        const x = (i * 53) % 400, y = (i * 97) % 400;
+        tight[4 * i] = x; tight[4 * i + 1] = y; tight[4 * i + 2] = x + 6; tight[4 * i + 3] = y + 6;
+        data[i] = i;
+    }
+    const margin = 2;
+    aabb2.fattenAll(fat, tight, margin, N); // disjoint output buffer (FORMAT.md rule)
+
+    const tree = new DynamicBVH2D(4 * N + 8);
+    tree.insertLeaves(fat, data, N);
+    tree.validate();
+
+    // Brute-force oracle over the SAME fattened geometry the tree stores.
+    const overlaps = (i, qx0, qy0, qx1, qy1) =>
+        fat[4 * i] <= qx1 && fat[4 * i + 2] >= qx0 && fat[4 * i + 1] <= qy1 && fat[4 * i + 3] >= qy0;
+
+    const out = new Int32Array(N);
+    // Box query.
+    const [qx0, qy0, qx1, qy1] = [50, 50, 260, 260];
+    const boxHits = Array.from(out.subarray(0, tree.query(box(qx0, qy0, qx1, qy1), out))).sort((a, b) => a - b);
+    const oracleBox = [];
+    for (let i = 0; i < N; i++) if (overlaps(i, qx0, qy0, qx1, qy1)) oracleBox.push(data[i]);
+    assert.deepEqual(boxHits, oracleBox.sort((a, b) => a - b), 'box query diverged from oracle');
+
+    // Point query: equals a degenerate box at that point.
+    const [px, py] = [tight[8] + 1, tight[9] + 1]; // inside box 2's tight (subset of fat)
+    const ptHits = Array.from(out.subarray(0, tree.queryPoint(px, py, out))).sort((a, b) => a - b);
+    const oraclePt = [];
+    for (let i = 0; i < N; i++) if (overlaps(i, px, py, px, py)) oraclePt.push(data[i]);
+    assert.deepEqual(ptHits, oraclePt.sort((a, b) => a - b), 'point query diverged from oracle');
+
+    // Raycast horizontal sweep.
+    const rc = tree.raycast(-10, 130, 410, 130, out);
+    assert.ok(rc >= 0 && rc <= N, 'raycast returned a sane count');
 });
 
 // =============================================================================

@@ -15,8 +15,8 @@
  *      inverted (min > max) and non-finite boxes are rejected by both.
  */
 
-import { aabb2 } from '@zakkster/lite-aabb';
-import { DynamicBVH2D } from '../../Bvh.js';
+import { aabb2, FORMAT_VERSION as AABB_FORMAT_VERSION } from '@zakkster/lite-aabb';
+import { DynamicBVH2D, FORMAT_VERSION } from '../../Bvh.js';
 import { check, setBox } from './harness.mjs';
 
 const FULL = (b) => setBox(b, -1e9, -1e9, 1e9, 1e9);
@@ -97,5 +97,62 @@ export function run() {
         try { tree.insertLeaf(inv, 0); } catch { threw = true; }
         check(threw, () => 'T8: an inverted box was not rejected at the door');
         check(tree.root === -1 && tree.nodeCount === 0, () => 'T8: inverted-box reject left state behind');
+    }
+
+    // --- 4. the FORMAT contract (X1): both packages agree on FORMAT_VERSION ---
+    check(FORMAT_VERSION === AABB_FORMAT_VERSION,
+        () => `T8: FORMAT_VERSION skew -- bvh ${FORMAT_VERSION} vs aabb ${AABB_FORMAT_VERSION}`);
+
+    // --- 5. packed round-trip: aabb2.fattenAll -> insertLeaves -> all 3 queries
+    // The producer/consumer conformance the twin 2.0.0 exists for. Build a packed
+    // `4*N` buffer with aabb2's batch op, feed it straight to the bvh's bulk entry
+    // with no per-box view, then assert every query kind agrees with a brute-force
+    // scan over the SAME fattened geometry the tree stores.
+    {
+        const N = 300;
+        const tight = new Float32Array(4 * N);
+        const fat = new Float32Array(4 * N);
+        const data = new Int32Array(N);
+        for (let i = 0; i < N; i++) {
+            const x = (i * 131) % 2048, y = (i * 257) % 2048;
+            tight[4 * i] = x; tight[4 * i + 1] = y; tight[4 * i + 2] = x + 5; tight[4 * i + 3] = y + 5;
+            data[i] = i;
+        }
+        aabb2.fattenAll(fat, tight, 3, N); // disjoint output (FORMAT.md rule)
+
+        const tree = new DynamicBVH2D(4 * N + 8);
+        check(tree.insertLeaves(fat, data, N) === N, () => 'T8: insertLeaves did not insert every box');
+        tree.validate();
+        check(tree.leafCount === N, () => `T8: leafCount ${tree.leafCount} != ${N} after bulk insert`);
+
+        const out = new Int32Array(N);
+        const bOverlap = (i, x0, y0, x1, y1) =>
+            fat[4 * i] <= x1 && fat[4 * i + 2] >= x0 && fat[4 * i + 1] <= y1 && fat[4 * i + 3] >= y0;
+
+        // Box query vs oracle.
+        const q = Float32Array.of(200, 200, 900, 900);
+        const nBox = tree.query(q, out);
+        const seenBox = new Set(Array.from(out.subarray(0, nBox)));
+        let oracleBox = 0;
+        for (let i = 0; i < N; i++) {
+            if (bOverlap(i, q[0], q[1], q[2], q[3])) {
+                oracleBox++;
+                check(seenBox.has(data[i]), () => `T8: round-trip box query missed leaf ${data[i]}`);
+            }
+        }
+        check(oracleBox === nBox, () => `T8: round-trip box query ${nBox} hits, oracle ${oracleBox}`);
+
+        // Point query vs oracle (a point inside box 7's tight bounds).
+        const px = tight[4 * 7] + 1, py = tight[4 * 7 + 1] + 1;
+        const nPt = tree.queryPoint(px, py, out);
+        const seenPt = new Set(Array.from(out.subarray(0, nPt)));
+        let oraclePt = 0;
+        for (let i = 0; i < N; i++) {
+            if (bOverlap(i, px, py, px, py)) {
+                oraclePt++;
+                check(seenPt.has(data[i]), () => `T8: round-trip point query missed leaf ${data[i]}`);
+            }
+        }
+        check(oraclePt === nPt, () => `T8: round-trip point query ${nPt} hits, oracle ${oraclePt}`);
     }
 }

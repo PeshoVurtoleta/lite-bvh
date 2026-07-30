@@ -1,10 +1,15 @@
 # @zakkster/lite-bvh
 
-> Zero-GC dynamic Bounding Volume Hierarchy for 2D. Flat Structure-of-Arrays layout, O(1) free-list allocation, Surface Area Heuristic insertion, iterative query that writes hits into a caller-provided `Int32Array`. **No allocations after construction.** Companion to `@zakkster/lite-aabb` (same leaf-AABB format).
+> Zero-GC dynamic Bounding Volume Hierarchy for 2D. Flat Structure-of-Arrays layout, O(1) free-list allocation, Surface Area Heuristic insertion, iterative query that writes hits into a caller-provided `Int32Array`. **No allocations after construction.** Companion to `@zakkster/lite-aabb` (same leaf-AABB format; see FORMAT.md and `FORMAT_VERSION`).
 
 ## API
 
-Single named export: `DynamicBVH2D`.
+Named exports: `DynamicBVH2D`, `VERSION`, `FORMAT_VERSION`.
+
+`FORMAT_VERSION` (integer, currently `1`) is the shared buffer-contract version --
+see FORMAT.md. `@zakkster/lite-aabb` exports the identical constant; assert them
+equal when mixing the two packages. It is on a separate axis from the semver
+`VERSION` and copied inline (no runtime dependency).
 
 ```ts
 class DynamicBVH2D {
@@ -17,6 +22,13 @@ class DynamicBVH2D {
     // on capacity exhaustion, a non-finite or inverted box, a bad `data`, or a
     // box aliasing the tree's own `bboxes` buffer.
     insertLeaf(leafAABB: Float32Array, data: number): number;       // returns node id
+
+    // Bulk insert of `count` boxes from one packed Float32Array (4*count floats,
+    // box i at [4i, 4i+3] -- the FORMAT.md packed layout). Reads by index, so it
+    // allocates NOTHING per box. BATCH-ATOMIC: validates every box/data/capacity
+    // before any mutation, so a single bad element throws with the tree unchanged.
+    insertLeaves(packed: Float32Array, dataArray: ArrayLike<number>,
+                 count: number): number;                            // returns count
 
     // O(log n) remove. Heals the gap by promoting the sibling.
     // THROWS on an invalid, freed, or non-leaf (internal) handle.
@@ -71,6 +83,7 @@ class DynamicBVH2D {
 ## Format
 
 - **AABB:** `Float32Array(4)` = `[minX, minY, maxX, maxY]`. Identical to `@zakkster/lite-aabb`. Must be finite and non-inverted (`minX <= maxX`, `minY <= maxY`) to enter the tree. A plain `Array`/`Float64Array` is accepted and coerced, but pass a `Float32Array` for exact `updateLeaf` fast-path behaviour.
+- **Packed `4*N`:** N boxes contiguously in one `Float32Array`, box `i` at slots `4i..4i+3` (stride 4). This is what `insertLeaves` consumes and what `@zakkster/lite-aabb`'s `fattenAll`/`mergeAll` produce. Full rules in FORMAT.md.
 - **`userData`:** a non-negative `int32` (`[0, 2^31-1]`) returned from `query()` — typically an ECS entity id. `-1` is reserved (internal-node sentinel).
 - **`outBuffer`:** caller-owned `Int32Array`; size for your worst-case query batch.
 
