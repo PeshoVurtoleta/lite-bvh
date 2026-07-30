@@ -1,0 +1,3572 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="A live 2D broadphase driven by the real source of @zakkster/lite-aabb and @zakkster/lite-bvh: dynamic BVH, point/box/ray queries, zero per-frame allocation.">
+<title>lite-aabb x lite-bvh - broadphase playground</title>
+</head>
+<body>
+<style>
+    /* ============================================================
+       lite-aabb x lite-bvh - broadphase instrument console
+       Palette: cool cyan = spatial STRUCTURE (the boxes/tree),
+       warm amber = QUERY RESULT (what a probe returns). green/red
+       are health semantics (zero-alloc / the O(N) danger line),
+       kept off the two accents so state reads at a glance.
+       The viewport is a deliberately dark instrument screen in
+       both themes; all surrounding chrome is theme-aware.
+       ============================================================ */
+    :root {
+        --ink: #0a0f1c;
+        --panel: #0f1a2e;
+        --panel-2: #0c1526;
+        --line: #21324b;
+        --line-soft: #182740;
+        --text: #e9eff8;
+        --text-mut: #8595b0;
+        --text-dim: #5f6f8c;
+        --struct: #43b4e4;
+        --struct-ink: #0a1420;
+        --struct-soft: rgba(67, 180, 228, 0.13);
+        --hit: #ffb454;
+        --hit-strong: #ffce7a;
+        --good: #4fd6a3;
+        --warn: #ffcf5c;
+        --bad: #ff6b6b;
+        --viewport: #060a12;
+        --viewport-grid: rgba(67, 180, 228, 0.07);
+        --shadow: 0 1px 0 rgba(255, 255, 255, 0.02), 0 12px 34px -18px rgba(0, 0, 0, 0.8);
+        --radius: 12px;
+        --radius-sm: 8px;
+        --mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+        --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    @media (prefers-color-scheme: light) {
+        :root {
+            --ink: #eef1f7;
+            --panel: #ffffff;
+            --panel-2: #f5f7fc;
+            --line: #d8deea;
+            --line-soft: #e7ebf3;
+            --text: #131a29;
+            --text-mut: #56637d;
+            --text-dim: #8b97ac;
+            --struct: #0e7fb8;
+            --struct-ink: #ffffff;
+            --struct-soft: rgba(14, 127, 184, 0.10);
+            --hit: #c56a08;
+            --hit-strong: #a85a06;
+            --good: #0f8a5c;
+            --warn: #b7791f;
+            --bad: #cf3a3a;
+            --shadow: 0 1px 0 rgba(255, 255, 255, 0.6), 0 14px 30px -20px rgba(20, 30, 60, 0.35);
+        }
+    }
+
+    /* Explicit toggle wins over the media query, both directions. */
+    :root[data-theme="dark"] {
+        --ink: #0a0f1c;
+        --panel: #0f1a2e;
+        --panel-2: #0c1526;
+        --line: #21324b;
+        --line-soft: #182740;
+        --text: #e9eff8;
+        --text-mut: #8595b0;
+        --text-dim: #5f6f8c;
+        --struct: #43b4e4;
+        --struct-ink: #0a1420;
+        --struct-soft: rgba(67, 180, 228, 0.13);
+        --hit: #ffb454;
+        --hit-strong: #ffce7a;
+        --good: #4fd6a3;
+        --warn: #ffcf5c;
+        --bad: #ff6b6b;
+        --shadow: 0 1px 0 rgba(255, 255, 255, 0.02), 0 12px 34px -18px rgba(0, 0, 0, 0.8);
+    }
+
+    :root[data-theme="light"] {
+        --ink: #eef1f7;
+        --panel: #ffffff;
+        --panel-2: #f5f7fc;
+        --line: #d8deea;
+        --line-soft: #e7ebf3;
+        --text: #131a29;
+        --text-mut: #56637d;
+        --text-dim: #8b97ac;
+        --struct: #0e7fb8;
+        --struct-ink: #ffffff;
+        --struct-soft: rgba(14, 127, 184, 0.10);
+        --hit: #c56a08;
+        --hit-strong: #a85a06;
+        --good: #0f8a5c;
+        --warn: #b7791f;
+        --bad: #cf3a3a;
+        --shadow: 0 1px 0 rgba(255, 255, 255, 0.6), 0 14px 30px -20px rgba(20, 30, 60, 0.35);
+    }
+
+    * {
+        box-sizing: border-box;
+    }
+
+    html, body {
+        margin: 0;
+    }
+
+    body {
+        background: var(--ink);
+        color: var(--text);
+        font-family: var(--sans);
+        -webkit-font-smoothing: antialiased;
+        line-height: 1.5;
+    }
+
+    .wrap {
+        max-width: 1320px;
+        margin: 0 auto;
+        padding: clamp(14px, 2.2vw, 26px);
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+    }
+
+    /* ---------- masthead ---------- */
+    .masthead {
+        display: flex;
+        align-items: center;
+        gap: 18px;
+        flex-wrap: wrap;
+    }
+
+    .brand {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        margin-right: auto;
+    }
+
+    .wordmark {
+        font-family: var(--mono);
+        font-weight: 700;
+        font-size: clamp(17px, 2.4vw, 23px);
+        letter-spacing: -0.01em;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin: 0;
+    }
+
+    .wordmark .x {
+        color: var(--text-dim);
+        font-weight: 400;
+    }
+
+    .wordmark .a {
+        color: var(--struct);
+    }
+
+    .wordmark .b {
+        color: var(--hit);
+    }
+
+    .tagline {
+        color: var(--text-mut);
+        font-size: 12.5px;
+        letter-spacing: 0.01em;
+    }
+
+    .mast-tools {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+    }
+
+    .badge {
+        font-family: var(--mono);
+        font-size: 11.5px;
+        letter-spacing: 0.02em;
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        color: var(--text-mut);
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        white-space: nowrap;
+    }
+
+    .badge b {
+        color: var(--text);
+        font-weight: 600;
+    }
+
+    .badge .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--good);
+        box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 22%, transparent);
+    }
+
+    .badge.bad .dot {
+        background: var(--bad);
+        box-shadow: 0 0 0 3px color-mix(in srgb, var(--bad) 22%, transparent);
+    }
+
+    .ver {
+        color: var(--struct);
+    }
+
+    .ver.b {
+        color: var(--hit);
+    }
+
+    .icon-btn {
+        font-family: var(--mono);
+        font-size: 12px;
+        background: var(--panel);
+        color: var(--text-mut);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        padding: 7px 11px;
+        cursor: pointer;
+        transition: border-color .15s, color .15s;
+    }
+
+    .icon-btn:hover {
+        color: var(--text);
+        border-color: var(--struct);
+    }
+
+    /* ---------- main stage ---------- */
+    /* One bounded height for the whole instrument: the viewport fills it and
+       the rail matches it (grid stretch), instead of an aspect-ratio viewport
+       ballooning the row. Clamp keeps it sane from laptop to wall display. */
+    .stage {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 316px;
+        gap: 16px;
+        align-items: stretch;
+        height: clamp(480px, 74vh, 760px);
+    }
+
+    @media (max-width: 940px) {
+        .stage {
+            grid-template-columns: minmax(0, 1fr);
+            height: auto; /* stacked: each item sizes itself, no shared height */
+        }
+    }
+
+    .viewport {
+        position: relative;
+        background: var(--viewport);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        overflow: hidden;
+        min-height: 0;
+        box-shadow: var(--shadow);
+    }
+
+    @media (max-width: 940px) {
+        .viewport {
+            /* no rail beside it here, so give the canvas its own bounded band */
+            height: clamp(340px, 52vh, 480px);
+        }
+    }
+
+    #scene {
+        display: block;
+        width: 100%;
+        height: 100%;
+        cursor: crosshair;
+        touch-action: none;
+    }
+
+    .vp-legend {
+        position: absolute;
+        left: 12px;
+        bottom: 12px;
+        display: flex;
+        gap: 14px;
+        flex-wrap: wrap;
+        font-family: var(--mono);
+        font-size: 11px;
+        color: #9fb0c9;
+        background: color-mix(in srgb, #060a12 74%, transparent);
+        border: 1px solid rgba(120, 140, 170, 0.16);
+        padding: 7px 11px;
+        border-radius: 8px;
+        backdrop-filter: blur(3px);
+        pointer-events: none;
+    }
+
+    .vp-legend span {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+    }
+
+    .swatch {
+        width: 10px;
+        height: 10px;
+        border-radius: 2px;
+    }
+
+    .sw-node {
+        background: transparent;
+        border: 1px solid var(--struct);
+    }
+
+    .sw-box {
+        background: color-mix(in srgb, var(--struct) 55%, transparent);
+    }
+
+    .sw-hit {
+        background: var(--hit);
+    }
+
+    .vp-hud {
+        position: absolute;
+        right: 12px;
+        top: 12px;
+        font-family: var(--mono);
+        font-size: 11px;
+        color: #9fb0c9;
+        background: color-mix(in srgb, #060a12 74%, transparent);
+        border: 1px solid rgba(120, 140, 170, 0.16);
+        padding: 6px 10px;
+        border-radius: 8px;
+        backdrop-filter: blur(3px);
+        pointer-events: none;
+        text-align: right;
+    }
+
+    .vp-hud b {
+        color: var(--hit-strong);
+    }
+
+    /* ---------- rail ---------- */
+    .rail {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        min-width: 0;
+        min-height: 0;
+        justify-content: space-around;
+        overflow-y: auto; /* if the cards outgrow the bounded stage, scroll here */
+    }
+
+    @media (max-width: 940px) {
+        .rail {
+            overflow-y: visible; /* stacked: let the page scroll, not the rail */
+        }
+    }
+
+    .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        padding: 14px;
+        box-shadow: var(--shadow);
+    }
+
+    .card > h2 {
+        font-family: var(--mono);
+        font-size: 10.5px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--text-dim);
+        margin: 0 0 11px;
+        font-weight: 600;
+    }
+
+    .stats {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 8px;
+    }
+
+    .stat {
+        background: var(--panel-2);
+        border: 1px solid var(--line-soft);
+        border-radius: var(--radius-sm);
+        padding: 9px 10px;
+    }
+
+    .stat .k {
+        font-family: var(--mono);
+        font-size: 9.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--text-dim);
+    }
+
+    .stat .v {
+        font-family: var(--mono);
+        font-size: 19px;
+        font-weight: 700;
+        color: var(--text);
+        font-variant-numeric: tabular-nums;
+        line-height: 1.15;
+        margin-top: 2px;
+    }
+
+    .stat .v small {
+        font-size: 11px;
+        color: var(--text-mut);
+        font-weight: 500;
+    }
+
+    .stat.accent .v {
+        color: var(--struct);
+    }
+
+    .stat.hit .v {
+        color: var(--hit);
+    }
+
+    /* health / sparkline card */
+    .meter-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 9px;
+    }
+
+    .alloc-pill {
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--struct-ink);
+        background: var(--good);
+        padding: 4px 9px;
+        border-radius: 999px;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+    }
+
+    .alloc-pill.warn {
+        background: var(--warn);
+    }
+
+    .alloc-sub {
+        font-family: var(--mono);
+        font-size: 10.5px;
+        color: var(--text-mut);
+    }
+
+    .spark-wrap {
+        position: relative;
+    }
+
+    canvas.spark {
+        display: block;
+        width: 100%;
+        height: 46px;
+    }
+
+    .spark-label {
+        position: absolute;
+        left: 2px;
+        top: 2px;
+        font-family: var(--mono);
+        font-size: 9.5px;
+        color: var(--text-dim);
+        letter-spacing: .06em;
+    }
+
+    .spark-val {
+        position: absolute;
+        right: 2px;
+        top: 2px;
+        font-family: var(--mono);
+        font-size: 10.5px;
+        color: var(--text-mut);
+        font-variant-numeric: tabular-nums;
+    }
+
+    .cmp-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        margin-top: 10px;
+    }
+
+    .cmp {
+        border: 1px solid var(--line-soft);
+        border-radius: var(--radius-sm);
+        padding: 8px 9px;
+        background: var(--panel-2);
+    }
+
+    .cmp .lab {
+        font-family: var(--mono);
+        font-size: 9.5px;
+        letter-spacing: .06em;
+        text-transform: uppercase;
+        color: var(--text-dim);
+    }
+
+    .cmp .num {
+        font-family: var(--mono);
+        font-size: 15px;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        margin-top: 2px;
+    }
+
+    .cmp.bvh .num {
+        color: var(--struct);
+    }
+
+    .cmp.lin .num {
+        color: var(--bad);
+    }
+
+    .cmp-foot {
+        margin-top: 9px;
+        font-family: var(--mono);
+        font-size: 11.5px;
+        color: var(--text-mut);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    .cmp-foot b {
+        color: var(--good);
+        font-weight: 700;
+    }
+
+    .cmp-disabled {
+        opacity: .42;
+    }
+
+    /* ---------- controls ---------- */
+    .ctl {
+        display: flex;
+        flex-direction: column;
+        gap: 13px;
+    }
+
+    /* Controls sit full-width below the stage and flow horizontally, so the
+       viewport stays bounded and the rail readouts keep their room. Each control
+       group is a grid cell; interactive rows bottom-align across the bar. */
+    .controlbar .ctl {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+        gap: 14px 22px;
+        align-items: end;
+    }
+
+    .controlbar .toggles {
+        gap: 8px;
+    }
+
+    @media (max-width: 520px) {
+        .controlbar .ctl {
+            grid-template-columns: 1fr;
+        }
+    }
+
+    .ctl-label {
+        font-family: var(--mono);
+        font-size: 10.5px;
+        letter-spacing: .06em;
+        text-transform: uppercase;
+        color: var(--text-dim);
+        margin-bottom: 6px;
+        display: flex;
+        justify-content: space-between;
+    }
+
+    .ctl-label .rv {
+        color: var(--text);
+        font-variant-numeric: tabular-nums;
+    }
+
+    .seg {
+        display: flex;
+        background: var(--panel-2);
+        border: 1px solid var(--line-soft);
+        border-radius: var(--radius-sm);
+        padding: 3px;
+        gap: 3px;
+    }
+
+    .seg label {
+        flex: 1;
+        text-align: center;
+        font-family: var(--mono);
+        font-size: 12px;
+        color: var(--text-mut);
+        padding: 6px 4px;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: background .14s, color .14s;
+        user-select: none;
+    }
+
+    .seg input {
+        position: absolute;
+        opacity: 0;
+        pointer-events: none;
+    }
+
+    .seg label:hover {
+        color: var(--text);
+    }
+
+    .seg input:checked + label {
+        background: var(--struct);
+        color: var(--struct-ink);
+        font-weight: 600;
+    }
+
+    .seg.warm input:checked + label {
+        background: var(--hit);
+    }
+
+    .seg input:focus-visible + label {
+        outline: 2px solid var(--text);
+        outline-offset: 1px;
+    }
+
+    input[type="range"] {
+        -webkit-appearance: none;
+        appearance: none;
+        width: 100%;
+        height: 4px;
+        border-radius: 999px;
+        background: var(--line);
+        outline: none;
+        margin: 6px 0 2px;
+    }
+
+    input[type="range"]::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        width: 15px;
+        height: 15px;
+        border-radius: 50%;
+        background: var(--struct);
+        cursor: pointer;
+        border: 2px solid var(--panel);
+        box-shadow: 0 0 0 1px var(--line);
+    }
+
+    input[type="range"]::-moz-range-thumb {
+        width: 15px;
+        height: 15px;
+        border-radius: 50%;
+        background: var(--struct);
+        cursor: pointer;
+        border: 2px solid var(--panel);
+    }
+
+    input[type="range"]:focus-visible::-webkit-slider-thumb {
+        box-shadow: 0 0 0 3px color-mix(in srgb, var(--struct) 45%, transparent);
+    }
+
+    .toggles {
+        display: flex;
+        flex-direction: column;
+        gap: 9px;
+    }
+
+    .toggle {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        cursor: pointer;
+        font-size: 13px;
+        color: var(--text);
+    }
+
+    .toggle .desc {
+        font-family: var(--sans);
+    }
+
+    .toggle .desc small {
+        display: block;
+        color: var(--text-dim);
+        font-size: 11px;
+        font-family: var(--mono);
+    }
+
+    .switch {
+        position: relative;
+        width: 38px;
+        height: 21px;
+        flex: none;
+        border-radius: 999px;
+        background: var(--line);
+        transition: background .16s;
+    }
+
+    .switch::after {
+        content: "";
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 17px;
+        height: 17px;
+        border-radius: 50%;
+        background: var(--panel);
+        transition: transform .16s;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, .35);
+    }
+
+    .toggle input {
+        position: absolute;
+        opacity: 0;
+    }
+
+    .toggle input:checked + .switch {
+        background: var(--struct);
+    }
+
+    .toggle input:checked + .switch::after {
+        transform: translateX(17px);
+    }
+
+    .toggle input:focus-visible + .switch {
+        outline: 2px solid var(--text);
+        outline-offset: 2px;
+    }
+
+    .btn-row {
+        display: flex;
+        gap: 8px;
+    }
+
+    .btn {
+        flex: 1;
+        font-family: var(--mono);
+        font-size: 12.5px;
+        padding: 9px 8px;
+        border-radius: var(--radius-sm);
+        border: 1px solid var(--line);
+        background: var(--panel-2);
+        color: var(--text);
+        cursor: pointer;
+        transition: border-color .14s, background .14s;
+    }
+
+    .btn:hover {
+        border-color: var(--struct);
+    }
+
+    .btn.primary {
+        background: var(--struct);
+        color: var(--struct-ink);
+        border-color: var(--struct);
+        font-weight: 600;
+    }
+
+    .btn.primary[data-paused="true"] {
+        background: var(--hit);
+        border-color: var(--hit);
+    }
+
+    .btn:focus-visible {
+        outline: 2px solid var(--text);
+        outline-offset: 2px;
+    }
+
+    /* ---------- pipeline strip ---------- */
+    .pipeline {
+    }
+
+    .pipe-flow {
+        display: flex;
+        align-items: stretch;
+        gap: 0;
+        flex-wrap: wrap;
+    }
+
+    .pipe-stage {
+        flex: 1;
+        min-width: 120px;
+        position: relative;
+        border: 1px solid var(--line-soft);
+        border-radius: var(--radius-sm);
+        padding: 11px 13px;
+        background: var(--panel-2);
+        transition: border-color .2s, background .2s, box-shadow .2s;
+    }
+
+    .pipe-stage + .pipe-stage {
+        margin-left: 26px;
+    }
+
+    .pipe-stage::before {
+        content: "->";
+        position: absolute;
+        left: -22px;
+        top: 50%;
+        transform: translateY(-50%);
+        font-family: var(--mono);
+        color: var(--text-dim);
+        font-size: 13px;
+    }
+
+    .pipe-stage:first-child::before {
+        content: none;
+    }
+
+    .pipe-stage .pk {
+        font-family: var(--mono);
+        font-size: 9.5px;
+        letter-spacing: .1em;
+        text-transform: uppercase;
+        color: var(--text-dim);
+    }
+
+    .pipe-stage .pv {
+        font-family: var(--mono);
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text);
+        margin-top: 3px;
+    }
+
+    .pipe-stage .po {
+        font-family: var(--mono);
+        font-size: 10.5px;
+        color: var(--text-mut);
+        margin-top: 2px;
+    }
+
+    .pipe-stage.lib-a {
+        --pc: var(--struct);
+    }
+
+    .pipe-stage.lib-b {
+        --pc: var(--hit);
+    }
+
+    .pipe-stage.active {
+        border-color: var(--pc, var(--struct));
+        background: color-mix(in srgb, var(--pc, var(--struct)) 12%, var(--panel-2));
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--pc) 30%, transparent);
+    }
+
+    .pipe-stage.active .pv {
+        color: var(--pc);
+    }
+
+    .pipe-tag {
+        font-family: var(--mono);
+        font-size: 10px;
+        padding: 1px 6px;
+        border-radius: 4px;
+        margin-left: 6px;
+        vertical-align: 1px;
+    }
+
+    .tag-a {
+        color: var(--struct);
+        background: var(--struct-soft);
+    }
+
+    .tag-b {
+        color: var(--hit);
+        background: color-mix(in srgb, var(--hit) 14%, transparent);
+    }
+
+    @media (max-width: 620px) {
+        .pipe-flow {
+            flex-direction: column;
+        }
+
+        .pipe-stage + .pipe-stage {
+            margin-left: 0;
+            margin-top: 22px;
+        }
+
+        .pipe-stage::before {
+            left: 50%;
+            top: -19px;
+            transform: translateX(-50%) rotate(90deg);
+        }
+    }
+
+    /* ---------- footer ---------- */
+    .footer {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 18px;
+        align-items: center;
+        justify-content: space-between;
+        color: var(--text-mut);
+        font-size: 12.5px;
+        padding-top: 4px;
+    }
+
+    .install {
+        font-family: var(--mono);
+        font-size: 12.5px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        padding: 9px 13px;
+        color: var(--text);
+    }
+
+    .install .cmd::before {
+        content: "$ ";
+        color: var(--text-dim);
+    }
+
+    .install .pkg-a {
+        color: var(--struct);
+    }
+
+    .install .pkg-b {
+        color: var(--hit);
+    }
+
+    .footer a {
+        color: var(--struct);
+        text-decoration: none;
+    }
+
+    .footer a:hover {
+        text-decoration: underline;
+    }
+
+    .foot-note {
+        max-width: 46ch;
+        font-family: var(--sans);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        * {
+            transition: none !important;
+            animation: none !important;
+        }
+    }
+</style>
+
+<div class="wrap">
+    <header class="masthead">
+        <div class="brand">
+            <h1 class="wordmark"><span class="a">lite-aabb</span> <span class="x">&#215;</span> <span
+                    class="b">lite-bvh</span></h1>
+            <div class="tagline">A live 2D broadphase, driven end to end by the actual shipped source of both zero-GC
+                libraries.
+            </div>
+        </div>
+        <div class="mast-tools">
+            <span class="badge" id="fmtBadge"><span class="dot"></span> FORMAT <b>v<span id="fmtV">1</span></b> &middot; aabb &#8646; bvh</span>
+            <span class="badge">aabb <b class="ver" id="verA">2.0.0</b> &middot; bvh <b class="ver b"
+                                                                                        id="verB">2.0.0</b></span>
+            <button class="icon-btn" id="themeBtn" type="button" aria-label="Toggle color theme">theme</button>
+        </div>
+    </header>
+
+    <div class="stage">
+        <div class="viewport">
+            <canvas id="scene"
+                    aria-label="Live broadphase viewport: moving axis-aligned boxes indexed by a dynamic BVH, with the current spatial query highlighted."></canvas>
+            <div class="vp-hud" id="vpHud"><b id="hudHits">0</b> hits<br><span id="hudMode">point</span></div>
+            <div class="vp-legend">
+                <span><i class="swatch sw-box"></i> entity AABB</span>
+                <span><i class="swatch sw-node"></i> BVH node</span>
+                <span><i class="swatch sw-hit"></i> query hit</span>
+            </div>
+        </div>
+
+        <aside class="rail">
+            <section class="card">
+                <h2>Telemetry</h2>
+                <div class="stats">
+                    <div class="stat accent">
+                        <div class="k">Entities</div>
+                        <div class="v" id="tEnt">0</div>
+                    </div>
+                    <div class="stat accent">
+                        <div class="k">BVH nodes</div>
+                        <div class="v" id="tNodes">0</div>
+                    </div>
+                    <div class="stat accent">
+                        <div class="k">Tree height</div>
+                        <div class="v" id="tHeight">0</div>
+                    </div>
+                    <div class="stat hit">
+                        <div class="k">Query hits</div>
+                        <div class="v" id="tHits">0</div>
+                    </div>
+                    <div class="stat">
+                        <div class="k">Frame</div>
+                        <div class="v" id="tFrame">0<small>ms</small></div>
+                    </div>
+                    <div class="stat">
+                        <div class="k">Leaves</div>
+                        <div class="v" id="tLeaves">0</div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="card">
+                <div class="meter-row">
+                    <h2 style="margin:0">Steady state</h2>
+                    <span class="alloc-pill" id="allocPill"><span class="dot"
+                                                                  style="width:7px;height:7px;border-radius:50%;background:currentColor"></span> 0 B / frame</span>
+                </div>
+                <div class="spark-wrap">
+                    <canvas class="spark" id="frameSpark"></canvas>
+                    <span class="spark-label">FRAME TIME &middot; 16.7ms budget</span>
+                    <span class="spark-val" id="sparkVal">0.0ms</span>
+                </div>
+                <div class="alloc-sub" id="heapLine" style="margin-top:8px">Broadphase pipeline reuses pre-allocated
+                    typed arrays &mdash; no per-frame allocation.
+                </div>
+            </section>
+
+            <section class="card" id="cmpCard">
+                <div class="meter-row">
+                    <h2 style="margin:0">BVH vs linear scan</h2>
+                </div>
+                <div class="cmp-grid">
+                    <div class="cmp bvh">
+                        <div class="lab">BVH query</div>
+                        <div class="num" id="cmpBvh">--</div>
+                    </div>
+                    <div class="cmp lin">
+                        <div class="lab">Linear O(n)</div>
+                        <div class="num" id="cmpLin">--</div>
+                    </div>
+                </div>
+                <div class="cmp-foot">
+                    <span id="cmpMatch">results match &mdash;</span>
+                    <span>speedup <b id="cmpSpeed">--</b></span>
+                </div>
+            </section>
+        </aside>
+    </div>
+
+    <section class="card controlbar">
+        <h2>Controls</h2>
+        <div class="ctl">
+                    <div>
+                        <div class="ctl-label">Query probe</div>
+                        <div class="seg warm" role="radiogroup" aria-label="Query probe">
+                            <input type="radio" name="qmode" id="qm-point" value="point" checked><label for="qm-point">point</label>
+                            <input type="radio" name="qmode" id="qm-box" value="box"><label for="qm-box">box</label>
+                            <input type="radio" name="qmode" id="qm-ray" value="ray"><label for="qm-ray">ray</label>
+                        </div>
+                    </div>
+
+                    <div>
+                        <div class="ctl-label">Broadphase refresh</div>
+                        <div class="seg" role="radiogroup" aria-label="Broadphase refresh strategy">
+                            <input type="radio" name="phase" id="ph-inc" value="inc" checked><label for="ph-inc">updateLeaf</label>
+                            <input type="radio" name="phase" id="ph-bulk" value="bulk"><label for="ph-bulk">bulk
+                            rebuild</label>
+                        </div>
+                    </div>
+
+                    <div>
+                        <div class="ctl-label"><span>Entities</span><span class="rv" id="rvEnt">1500</span></div>
+                        <input type="range" id="sEnt" min="250" max="8000" step="50" value="1500">
+                    </div>
+                    <div>
+                        <div class="ctl-label"><span>Fat margin</span><span class="rv" id="rvMargin">6.0</span></div>
+                        <input type="range" id="sMargin" min="0" max="24" step="0.5" value="6">
+                    </div>
+                    <div>
+                        <div class="ctl-label"><span>Speed</span><span class="rv" id="rvSpeed">1.00x</span></div>
+                        <input type="range" id="sSpeed" min="0" max="2.5" step="0.05" value="1">
+                    </div>
+
+                    <div class="toggles">
+                        <label class="toggle">
+                            <span class="desc">BVH tree overlay <small>draw internal-node boxes</small></span>
+                            <input type="checkbox" id="tgTree"><span class="switch"></span>
+                        </label>
+                        <label class="toggle">
+                            <span class="desc">Compare vs linear <small>time an O(n) scan too</small></span>
+                            <input type="checkbox" id="tgCmp" checked><span class="switch"></span>
+                        </label>
+                        <label class="toggle">
+                            <span class="desc">Reference grid <small>viewport gridlines</small></span>
+                            <input type="checkbox" id="tgGrid" checked><span class="switch"></span>
+                        </label>
+                    </div>
+
+                    <div class="btn-row">
+                        <button class="btn primary" id="btnPause" type="button" data-paused="false">Pause</button>
+                        <button class="btn" id="btnStep" type="button">Step</button>
+                        <button class="btn" id="btnReseed" type="button">Reseed</button>
+                    </div>
+                </div>
+            </section>
+
+    <section class="card pipeline">
+        <h2>Per-frame pipeline <span id="pipeModeTag" class="pipe-tag tag-a">incremental</span></h2>
+        <div class="pipe-flow" id="pipeFlow">
+            <div class="pipe-stage" id="ps-move">
+                <div class="pk">1 &middot; integrate</div>
+                <div class="pv">move entities</div>
+                <div class="po">tight AABB per body</div>
+            </div>
+            <div class="pipe-stage lib-a" id="ps-fat">
+                <div class="pk">2 &middot; aabb2</div>
+                <div class="pv" id="psFatName">updateLeaf refit</div>
+                <div class="po" id="psFatOp">fat bounds</div>
+            </div>
+            <div class="pipe-stage lib-b" id="ps-ins">
+                <div class="pk">3 &middot; bvh</div>
+                <div class="pv" id="psInsName">SAH descent</div>
+                <div class="po" id="psInsOp">O(log n) / body</div>
+            </div>
+            <div class="pipe-stage lib-b" id="ps-qry">
+                <div class="pk">4 &middot; bvh</div>
+                <div class="pv" id="psQryName">queryPoint</div>
+                <div class="po">iterative, 0 alloc</div>
+            </div>
+        </div>
+    </section>
+
+    <footer class="footer">
+        <div class="install"><span class="cmd">npm i <span class="pkg-a">@zakkster/lite-aabb</span> <span class="pkg-b">@zakkster/lite-bvh</span></span>
+        </div>
+        <div class="foot-note">Both libraries are inlined <em>verbatim</em> from their published source &mdash; the same
+            <code>Float32Array(4)</code> leaf format, agreed by <code>FORMAT_VERSION</code>. Zero runtime dependencies,
+            zero allocation on the hot path. MIT.
+        </div>
+    </footer>
+</div>
+
+<script type="module">
+    /* ============================================================================
+     * The two libraries below are inlined VERBATIM from their published packages,
+     * @zakkster/lite-aabb@2.0.0 and @zakkster/lite-bvh@2.0.0. The only edits are to
+     * the top-level `export` bindings (renamed to coexist in one module scope); the
+     * algorithm bodies are byte-for-byte the shipped source. This page runs the
+     * real code -- that is the whole point of the demo.
+     * ==========================================================================*/
+
+    /**
+ * @zakkster/lite-aabb -- Zero-GC 2D Axis-Aligned Bounding Boxes
+ *
+ * Format: Float32Array(4) -> [minX, minY, maxX, maxY]
+ *
+ * Every operation that returns an AABB writes into a caller-provided `out`
+ * buffer. The only allocators are `create()` and `clone()` -- call them at
+ * initialization, never in your hot loop.
+ *
+ * Compatible with the leaf-AABB format expected by `@zakkster/lite-bvh`.
+ *
+ * @license MIT
+ * @author Zahary Shinikchiev
+ */
+
+/** Package version. Keep in sync with package.json and CHANGELOG.md (three-place sync). */
+const AABB_VERSION = '2.0.0';
+
+/**
+ * The version of the shared FORMAT contract (see FORMAT.md), NOT the package
+ * version. `@zakkster/lite-bvh` exports the identical constant; the two packages
+ * compare it for equality to detect a format skew. It is an integer compared for
+ * equality, on a separate axis from `VERSION` -- do not sync it to semver.
+ * Bumps only when the buffer layout itself changes (decisions/0005). (v2.0.0+)
+ */
+const AABB_FORMAT_VERSION = 1;
+
+/*
+ * Module-private scratch for marginFloor's exact float32-ULP computation.
+ * Allocated ONCE at import, never in a hot path, never resized. Reading a
+ * value's next representable float32 via its bit pattern is exact across the
+ * whole normal range -- unlike Math.log2, which rounds at powers of two.
+ * This is module-local state with no externally observable effect, so it does
+ * not violate `sideEffects: false`.
+ */
+const _ulpF32 = new Float32Array(1);
+const _ulpI32 = new Int32Array(_ulpF32.buffer);
+
+/**
+ * Aliasing contract (see decisions/0001-aliasing.md):
+ *
+ *   `out` may safely alias ANY input, under ANY view relationship -- the same
+ *   view, a shifted/partially-overlapping view of one buffer, or a distinct
+ *   buffer. Every writer below snapshots all of its array inputs into locals
+ *   BEFORE the first write to `out`, so a write can never clobber a slot that a
+ *   later read still needs. These are register-resident locals in V8: no
+ *   allocation is added to any hot body (proven by test/torture t6 + the
+ *   assertOps gate; measured numbers in the decision record).
+ *
+ * The namespace is frozen (A-06): its operations are a contract, not a mutable
+ * bag. Reassigning a method throws in strict mode (ESM is always strict).
+ *
+ * Degenerate-value law (see decisions/0002-degenerate-values.md):
+ *
+ *   NaN propagates -- it is never laundered into a clean number. Every box is
+ *   one of three states: VALID (four finite coordinates, min <= max), EMPTY
+ *   (the canonical sentinel [Inf,Inf,-Inf,-Inf], a merge identity), or GARBAGE
+ *   (NaN, mixed infinities, or inverted). The hot ops are TOTAL but only
+ *   meaningful on valid boxes: geometry on a non-valid box returns whatever the
+ *   arithmetic yields -- it never throws and never allocates. Gate at trust
+ *   boundaries with `isValid`; recognize / build the empty box with `isEmpty` /
+ *   `setEmpty`. Validation is never bolted into a hot op (the one carve-out is
+ *   `overlapArea`, which stops laundering NaN -- measured cost in the record).
+ *
+ * Precision law (see decisions/0003-precision.md):
+ *
+ *   Float32 has a coordinate-dependent step (ULP). Once the requested `fatten`
+ *   margin drops below that step, it rounds away and the box does not widen --
+ *   silently, since `contains` still returns true (A-01). This is a property of
+ *   f32, not a bug in `fatten`, so `fatten` is UNCHANGED: it never gains a
+ *   branch and never bumps the result. Instead `marginFloor(a)` reports the
+ *   smallest margin that provably widens the box at its coordinates, and the
+ *   caller clamps: `fatten(out, a, Math.max(margin, marginFloor(a)))`. Same
+ *   boundary-predicate shape as `isValid` -- detection lives at the door, the
+ *   hot body stays branchless.
+ */
+const aabb2 = Object.freeze({
+    /**
+     * Allocates a new AABB. Call once at setup; never in a hot loop.
+     * @param {number} [minX=0]
+     * @param {number} [minY=0]
+     * @param {number} [maxX=0]
+     * @param {number} [maxY=0]
+     * @returns {Float32Array} length 4
+     */
+    create(minX = 0, minY = 0, maxX = 0, maxY = 0) {
+        const out = new Float32Array(4);
+        out[0] = minX;
+        out[1] = minY;
+        out[2] = maxX;
+        out[3] = maxY;
+        return out;
+    },
+
+    /**
+     * Allocates a new AABB with the same values as `a`. Call once at setup.
+     * @param {Float32Array} a
+     * @returns {Float32Array} length 4
+     */
+    clone(a) {
+        const out = new Float32Array(4);
+        out[0] = a[0];
+        out[1] = a[1];
+        out[2] = a[2];
+        out[3] = a[3];
+        return out;
+    },
+
+    /**
+     * Copies `a` into `out`. Zero allocations.
+     * @param {Float32Array} out
+     * @param {Float32Array} a
+     * @returns {Float32Array} `out`
+     */
+    copy(out, a) {
+        // Snapshot before writing: safe even when `out` is a shifted view of `a`.
+        const a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3];
+        out[0] = a0;
+        out[1] = a1;
+        out[2] = a2;
+        out[3] = a3;
+        return out;
+    },
+
+    /**
+     * Writes explicit bounds into `out`. Zero allocations.
+     * @param {Float32Array} out
+     * @param {number} minX
+     * @param {number} minY
+     * @param {number} maxX
+     * @param {number} maxY
+     * @returns {Float32Array} `out`
+     */
+    set(out, minX, minY, maxX, maxY) {
+        out[0] = minX;
+        out[1] = minY;
+        out[2] = maxX;
+        out[3] = maxY;
+        return out;
+    },
+
+    /**
+     * `out = bounding box enclosing both a and b`. Safe when `out` aliases `a` or `b`.
+     * @param {Float32Array} out
+     * @param {Float32Array} a
+     * @param {Float32Array} b
+     * @returns {Float32Array} `out`
+     */
+    merge(out, a, b) {
+        // Snapshot both inputs before writing: safe under any aliasing of
+        // `out`, `a`, `b`, including shifted/overlapping views of one buffer.
+        const a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3];
+        const b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3];
+        out[0] = Math.min(a0, b0);
+        out[1] = Math.min(a1, b1);
+        out[2] = Math.max(a2, b2);
+        out[3] = Math.max(a3, b3);
+        return out;
+    },
+
+    /**
+     * Enlarges `out` in place to include `b`. Branchless via `Math.min/max`.
+     * Equivalent to `merge(out, out, b)` but avoids one indirection.
+     * @param {Float32Array} out
+     * @param {Float32Array} b
+     * @returns {Float32Array} `out`
+     */
+    extend(out, b) {
+        // `out` is both source and destination. Snapshot both (out and b)
+        // before writing so an overlapping-view `b` reads its pre-write values.
+        const o0 = out[0], o1 = out[1], o2 = out[2], o3 = out[3];
+        const b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3];
+        out[0] = Math.min(o0, b0);
+        out[1] = Math.min(o1, b1);
+        out[2] = Math.max(o2, b2);
+        out[3] = Math.max(o3, b3);
+        return out;
+    },
+
+    /**
+     * Perimeter (2*(w+h)). Used as the Surface Area Heuristic cost in 2D BVHs.
+     * @param {Float32Array} a
+     * @returns {number}
+     */
+    perimeter(a) {
+        const wx = a[2] - a[0];
+        const wy = a[3] - a[1];
+        return 2 * (wx + wy);
+    },
+
+    /**
+     * Area (width * height). Negative for inverted boxes (don't do that).
+     * @param {Float32Array} a
+     * @returns {number}
+     */
+    area(a) {
+        const wx = a[2] - a[0];
+        const wy = a[3] - a[1];
+        return wx * wy;
+    },
+
+    /**
+     * Area of the intersection of `a` and `b`. Returns `0` if they don't overlap.
+     * @param {Float32Array} a
+     * @param {Float32Array} b
+     * @returns {number}
+     */
+    overlapArea(a, b) {
+        const minX = Math.max(a[0], b[0]);
+        const minY = Math.max(a[1], b[1]);
+        const maxX = Math.min(a[2], b[2]);
+        const maxY = Math.min(a[3], b[3]);
+        const wx = maxX - minX;
+        const wy = maxY - minY;
+        if (wx > 0 && wy > 0) return wx * wy;
+        // NaN in -> NaN out (A-03): a NaN coordinate poisons wx/wy, and we
+        // propagate it instead of laundering it to a clean 0. A genuine
+        // non-overlap (finite, touching or disjoint) still returns 0.
+        return wx !== wx || wy !== wy ? NaN : 0;
+    },
+
+    /**
+     * True if `a` and `b` overlap (touching counts as overlapping).
+     * @param {Float32Array} a
+     * @param {Float32Array} b
+     * @returns {boolean}
+     */
+    intersects(a, b) {
+        return a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1];
+    },
+
+    /**
+     * True if `a` fully contains `b` (touching edges count).
+     * @param {Float32Array} a
+     * @param {Float32Array} b
+     * @returns {boolean}
+     */
+    contains(a, b) {
+        return a[0] <= b[0] && a[1] <= b[1] && a[2] >= b[2] && a[3] >= b[3];
+    },
+
+    /**
+     * Expands `a` by `margin` on every side and writes into `out`.
+     * Negative margins are allowed (shrink); the caller is responsible for
+     * the result staying non-inverted. Safe when `out === a`.
+     * @param {Float32Array} out
+     * @param {Float32Array} a
+     * @param {number} margin
+     * @returns {Float32Array} `out`
+     */
+    fatten(out, a, margin) {
+        // Snapshot before writing: safe when `out` is a shifted view of `a`.
+        const a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3];
+        out[0] = a0 - margin;
+        out[1] = a1 - margin;
+        out[2] = a2 + margin;
+        out[3] = a3 + margin;
+        return out;
+    },
+
+    // --- degenerate-value law (A2, see decisions/0002-degenerate-values.md) ---
+    // Opt-in predicates + sentinel builder. These are NEW surface; they are how
+    // a caller checks a box at a trust boundary. They are NOT guards bolted into
+    // the twelve ops above -- those stay branchless (the sole exception is
+    // overlapArea's NaN check).
+
+    /**
+     * True if `a` is a box you can safely do geometry with: all four
+     * coordinates finite AND `min <= max` on both axes. False for NaN, for
+     * mixed infinities, and for inverted boxes; true for zero-size boxes. The
+     * canonical empty sentinel is NOT valid (it is non-finite by construction)
+     * -- recognize it with `isEmpty`. Zero allocations.
+     * @param {Float32Array} a
+     * @returns {boolean}
+     */
+    isValid(a) {
+        return Number.isFinite(a[0]) && Number.isFinite(a[1]) &&
+               Number.isFinite(a[2]) && Number.isFinite(a[3]) &&
+               a[0] <= a[2] && a[1] <= a[3];
+    },
+
+    /**
+     * True if `a` is exactly the canonical empty box `[Inf, Inf, -Inf, -Inf]`.
+     * That box is the identity of `merge`/`extend` (min/max collapse to the
+     * other operand), so it is the correct seed for an accumulating reducer.
+     * Zero allocations.
+     * @param {Float32Array} a
+     * @returns {boolean}
+     */
+    isEmpty(a) {
+        return a[0] === Infinity && a[1] === Infinity &&
+               a[2] === -Infinity && a[3] === -Infinity;
+    },
+
+    /**
+     * Writes the canonical empty box `[Inf, Inf, -Inf, -Inf]` into `out` and
+     * returns it. Use this as the seed for a `merge`/`extend` reduction instead
+     * of hand-rolling the sentinel. Do NOT call `area`/`perimeter` on the empty
+     * box (they are `+Infinity`/`-Infinity`); guard with `isValid` first.
+     * Zero allocations.
+     * @param {Float32Array} out
+     * @returns {Float32Array} `out`
+     */
+    setEmpty(out) {
+        out[0] = Infinity;
+        out[1] = Infinity;
+        out[2] = -Infinity;
+        out[3] = -Infinity;
+        return out;
+    },
+
+    /**
+     * The smallest margin that PROVABLY widens `a` on all four sides at its
+     * coordinates: the float32 ULP (gap to the next representable value) of the
+     * largest-magnitude coordinate. Any `margin >= marginFloor(a)` is guaranteed
+     * to move every side; a smaller margin may round away (finding A-01). Use it
+     * to clamp: `fatten(out, a, Math.max(margin, marginFloor(a)))`.
+     *
+     * The upper ULP is returned deliberately -- it is the coarser of the two
+     * steps around the coordinate, so it widens both the subtracted min sides
+     * and the added max sides (e.g. at 2^24 the min side moves by 1.0 but the
+     * max side needs 2.0). Defined on any box: it reads magnitudes, not order.
+     *
+     * Fail closed on non-finite input: a NaN coordinate yields NaN; an infinite
+     * coordinate yields Infinity (no finite margin widens an infinite box). A
+     * zero box yields the smallest subnormal, the true minimal step near zero.
+     * Zero allocations (the ULP scratch is allocated once at module load).
+     * @param {Float32Array} a
+     * @returns {number}
+     */
+    marginFloor(a) {
+        const m = Math.max(Math.abs(a[0]), Math.abs(a[1]),
+                           Math.abs(a[2]), Math.abs(a[3]));
+        // m is Infinity or NaN here iff a coordinate was non-finite.
+        if (!(m < Infinity)) return m === m ? Infinity : NaN;
+        _ulpF32[0] = m;      // round the magnitude to float32
+        _ulpI32[0] += 1;     // bit pattern of the next float32 above m (m >= 0)
+        return _ulpF32[0] - m;
+    },
+
+    // --- 2D op set (A4, see decisions/0004-2d-op-set.md) ---
+    // Point containment, box-to-box squared distance, closest point on a box.
+    // Pure, branchless, zero-alloc; they obey the touching-edge convention
+    // (A-02), the aliasing rule (A1), and the degenerate law (A2) like every op
+    // above. NEW surface only -- nothing pinned changes.
+
+    /**
+     * True if the point `(px, py)` lies inside `a`, edges and corners included
+     * (the A-02 touching convention, same as `contains`). A point is equivalent
+     * to a zero-size box here: `containsPoint(a, px, py)` agrees with
+     * `contains(a, [px, py, px, py])`.
+     *
+     * Fails closed on NaN: a NaN in the point or the box makes a comparison
+     * false, so the result is `false` -- never a spurious `true`. (Boolean
+     * predicates fail closed; the numeric ops propagate NaN as a value.)
+     * Zero allocations.
+     * @param {Float32Array} a
+     * @param {number} px
+     * @param {number} py
+     * @returns {boolean}
+     */
+    containsPoint(a, px, py) {
+        return px >= a[0] && px <= a[2] && py >= a[1] && py <= a[3];
+    },
+
+    /**
+     * Squared Euclidean distance between boxes `a` and `b`. `0` when they
+     * overlap OR touch; the true squared gap when disjoint. Symmetric.
+     *
+     * Squared, not distance -- the caller takes one `Math.sqrt` if they need the
+     * metric, and comparisons (`distanceSq(a, b) < r * r`) need no root at all.
+     * NaN propagates (A2): a NaN coordinate yields NaN, never a laundered 0.
+     * Zero allocations.
+     * @param {Float32Array} a
+     * @param {Float32Array} b
+     * @returns {number}
+     */
+    distanceSq(a, b) {
+        // Per axis: positive only when the intervals are strictly apart; 0 when
+        // they overlap or touch. Math.max(0, NaN, x) is NaN, so NaN propagates.
+        const dx = Math.max(0, a[0] - b[2], b[0] - a[2]);
+        const dy = Math.max(0, a[1] - b[3], b[1] - a[3]);
+        return dx * dx + dy * dy;
+    },
+
+    /**
+     * Closest point on box `a` to the query point `(px, py)`, written into
+     * `out2`. Inside the box the point maps to itself; outside, to the nearest
+     * edge or corner. Idempotent (the closest point of a closest point is
+     * itself).
+     *
+     * IMPORTANT: `out2` is a LENGTH-2 `Float32Array` (a Vec2 `[x, y]`), NOT a
+     * length-4 AABB. It is the only length-2 buffer in this package; passing a
+     * length-4 box here (or this result to a box op) will read/write the wrong
+     * slots without throwing. The `out2` name marks the arity at the call site.
+     *
+     * `out2` may safely alias `a` under any view relationship: `a`'s bounds are
+     * snapshotted before the first write (aliasing law, A1). Zero allocations.
+     * @param {Float32Array} out2 length 2
+     * @param {Float32Array} a
+     * @param {number} px
+     * @param {number} py
+     * @returns {Float32Array} `out2`
+     */
+    closestPoint(out2, a, px, py) {
+        // Snapshot before writing: safe when out2 is a shifted view of a.
+        const a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3];
+        out2[0] = Math.min(Math.max(px, a0), a2);
+        out2[1] = Math.min(Math.max(py, a1), a3);
+        return out2;
+    },
+
+    // --- packed 4*N batch ops (X1, see decisions/0005-format-and-batch.md) ---
+    // Operate over a packed Float32Array of N boxes (4*N floats, box i at slots
+    // 4i..4i+3), so a broadphase feed fattens / unions / probes many boxes in one
+    // call without a per-box view. `count` bounds every loop -- a count of 0,
+    // negative, or NaN runs zero iterations (fail closed). The caller owns buffer
+    // length (inPacked.length >= 4*count); an out-of-range read yields NaN, which
+    // propagates. See FORMAT.md for the layout and the packed aliasing rules.
+
+    /**
+     * Fattens each of `count` boxes in `inPacked` by `margin` and writes them
+     * into `outPacked`, box for box. Mirrors `fatten` exactly: subtract `margin`
+     * from the mins, add to the maxes, no auto-clamp (the margin floor stays the
+     * caller's job -- clamp per box with `marginFloor` if you need it). Returns
+     * `outPacked`.
+     *
+     * Aliasing (A1, decisions/0005 D4): `outPacked === inPacked` (in place) is
+     * safe, and a fully-disjoint `outPacked` is safe. A SHIFTED/overlapping view
+     * of `inPacked` is NOT supported -- an element-wise write to box i would
+     * clobber a neighbour's input. Use in-place or a disjoint buffer.
+     * Zero allocations.
+     * @param {Float32Array} outPacked length >= 4*count
+     * @param {Float32Array} inPacked length >= 4*count
+     * @param {number} margin
+     * @param {number} count number of boxes
+     * @returns {Float32Array} `outPacked`
+     */
+    fattenAll(outPacked, inPacked, margin, count) {
+        for (let i = 0; i < count; i++) {
+            const j = i << 2;
+            // Snapshot the box's four slots before writing (in-place safe).
+            const x0 = inPacked[j], y0 = inPacked[j + 1];
+            const x1 = inPacked[j + 2], y1 = inPacked[j + 3];
+            outPacked[j] = x0 - margin;
+            outPacked[j + 1] = y0 - margin;
+            outPacked[j + 2] = x1 + margin;
+            outPacked[j + 3] = y1 + margin;
+        }
+        return outPacked;
+    },
+
+    /**
+     * Unions `count` boxes from `inPacked` into the single box `out4`. Returns
+     * `out4`. Seeded with the canonical empty box, so `count === 0` yields the
+     * empty sentinel `[Inf, Inf, -Inf, -Inf]` (`isEmpty(out4)` is then true) --
+     * the correct bounding box of zero boxes and a valid merge-reduction seed.
+     *
+     * All reads happen before the single terminal write, so `out4` may safely
+     * alias ANYWHERE in `inPacked` (A1, decisions/0005 D4). Zero allocations.
+     * @param {Float32Array} out4 length 4
+     * @param {Float32Array} inPacked length >= 4*count
+     * @param {number} count number of boxes
+     * @returns {Float32Array} `out4`
+     */
+    mergeAll(out4, inPacked, count) {
+        // Accumulate in registers; write out4 once at the end (alias-safe).
+        // Math.min/max (not comparisons) so this folds EXACTLY like `merge`:
+        // NaN propagates instead of being skipped, and the Inf/-Inf seed makes
+        // count === 0 collapse to the empty sentinel.
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (let i = 0; i < count; i++) {
+            const j = i << 2;
+            minX = Math.min(minX, inPacked[j]);
+            minY = Math.min(minY, inPacked[j + 1]);
+            maxX = Math.max(maxX, inPacked[j + 2]);
+            maxY = Math.max(maxY, inPacked[j + 3]);
+        }
+        out4[0] = minX;
+        out4[1] = minY;
+        out4[2] = maxX;
+        out4[3] = maxY;
+        return out4;
+    },
+
+    /**
+     * Returns the lowest index in `[0, count)` whose box in `inPacked`
+     * intersects `b`, or `-1` if none do. Touching edges count as intersecting
+     * (the A-02 convention, the same test as `intersects`). `count === 0`
+     * returns `-1`. Read-only -- `b` may itself be a view into `inPacked`.
+     * Zero allocations.
+     * @param {Float32Array} inPacked length >= 4*count
+     * @param {Float32Array} b length 4
+     * @param {number} count number of boxes
+     * @returns {number} first intersecting index, or -1
+     */
+    intersectsAny(inPacked, b, count) {
+        const b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3];
+        for (let i = 0; i < count; i++) {
+            const j = i << 2;
+            if (inPacked[j] <= b2 && inPacked[j + 2] >= b0 &&
+                inPacked[j + 1] <= b3 && inPacked[j + 3] >= b1) {
+                return i;
+            }
+        }
+        return -1;
+    }
+});
+
+
+    /**
+ * @zakkster/lite-bvh — Zero-GC Dynamic Bounding Volume Hierarchy (2D)
+ *
+ * Flat-array Structure-of-Arrays (SoA) layout. One contiguous block per
+ * tree field; nodes are referenced by index, not by object reference.
+ * Internal free-list provides O(1) node allocation / deallocation with no
+ * GC pressure during gameplay.
+ *
+ * Algorithm: Box2D-style dynamic AABB tree (Erin Catto). Insert uses the
+ * Surface Area Heuristic; remove heals the gap by promoting the sibling;
+ * update has a fast path that does nothing when the tight bounds are still
+ * contained inside the fat bounds. The refit walk rebalances with Box2D-style
+ * single rotations (`_balance`), so an adversarial insert order (e.g. a
+ * monotone sweep) can no longer degrade the tree into a linked list -- height
+ * stays O(log n), which is what keeps `query` shallow and allocation-free.
+ *
+ * Leaf-AABB format: `Float32Array(4)` -> `[minX, minY, maxX, maxY]`,
+ * compatible with `@zakkster/lite-aabb`.
+ *
+ * @license MIT
+ * @author Zahary Shinikchiev
+ */
+
+/**
+ * `children[id<<1]` doubles as a tri-state liveness marker, which is what makes
+ * O(1) handle validation possible without a traversal:
+ *   -1  -> a live LEAF (both child slots -1, set by _allocateNode)
+ *  >=0  -> an INTERNAL node (a real left child)
+ *   -2  -> a FREED slot (set by _freeNode; also the initial fill)
+ * So `children[id<<1] === -1` is true for exactly the live leaves.
+ */
+const FREED = -2;
+
+/**
+ * Upper bound on `maxNodes`. Node fields are addressed by `id << 2` (bboxes),
+ * so ids must stay well inside the positive int32 range; 2^26 nodes is already
+ * ~1 GB of bboxes and far below that limit. Anything larger is a caller error.
+ */
+const MAX_NODES = 1 << 26;
+
+class DynamicBVH2D {
+    /** Maximum number of nodes (leaves + internal). Set at construction. */
+    maxNodes;
+
+    // ---- SoA tree data ----
+    /** Float32Array(maxNodes * 4) — `[minX, minY, maxX, maxY]` per node. */
+    bboxes;
+    /** Int32Array(maxNodes) — parent node id, or -1 for the root. */
+    parents;
+    /** Int32Array(maxNodes * 2) — `[leftChild, rightChild]`, both -1 for leaves. */
+    children;
+    /** Int32Array(maxNodes) — subtree height; 0 for leaves. */
+    heights;
+    /** Int32Array(maxNodes) — user data per leaf (e.g. ECS entity id). -1 for internal nodes. */
+    userData;
+
+    // ---- Free-list allocator ----
+    /** Int32Array(maxNodes) — chain of free node ids. */
+    nextFree;
+    /** Head of the free-list chain (-1 = full). */
+    freeHead = 0;
+    /** Currently allocated node count (leaves + internal). */
+    nodeCount = 0;
+
+    /** Root node id, or -1 if the tree is empty. */
+    root = -1;
+
+    // ---- Traversal scratch ----
+    /**
+     * Stack reused across all `query()` calls. Fixed size, NEVER grows: the
+     * iterative DFS uses at most `height + 1` slots, and with rotations keeping
+     * height at O(log n) the 256 slots here are only exhausted by a tree of
+     * height 255 -- a balanced tree of ~2^250 nodes, far beyond the 2^26 node
+     * cap. Overflow therefore means the tree is more degenerate than rotations
+     * permit, i.e. corruption; `query` throws (fail-closed) rather than silently
+     * allocating a bigger stack inside the hot loop (the old B-08 behaviour).
+     */
+    queryStack = new Int32Array(256);
+
+    /** Internal scratch AABB for re-insertion fattening. Never exposed. */
+    _scratchAABB;
+
+    /** Internal scratch box for `insertLeaves` to copy each packed box into,
+     *  so the bulk path allocates no per-box view. Never exposed. */
+    _batchScratch;
+
+    /**
+     * @param {number} maxNodes Hard cap on total nodes (leaves + internal). Internal
+     *   nodes are needed too — for N leaves you'll create at most 2N-1 total nodes,
+     *   so size accordingly. Typical: `maxNodes = 4 * expectedEntities`.
+     */
+    constructor(maxNodes) {
+        // B-09: fail closed on a bad capacity with a library error, not a raw
+        // RangeError from a typed-array allocator three lines down. Note a
+        // two-leaf tree needs at least 3 nodes (2 leaves + 1 internal parent).
+        if (!Number.isInteger(maxNodes) || maxNodes < 1 || maxNodes > MAX_NODES) {
+            throw new Error(
+                'lite-bvh: maxNodes must be an integer in [1, ' + MAX_NODES + '], got ' + maxNodes);
+        }
+        this.maxNodes = maxNodes;
+
+        this.bboxes   = new Float32Array(maxNodes * 4);
+        this.parents  = new Int32Array(maxNodes).fill(-1);
+        // Every node starts FREED (-2). _allocateNode flips a slot's left child
+        // to -1 (live leaf); insertLeaf gives internal nodes real children.
+        this.children = new Int32Array(maxNodes * 2).fill(FREED);
+        this.heights  = new Int32Array(maxNodes);
+        this.userData = new Int32Array(maxNodes).fill(-1);
+
+        this.nextFree = new Int32Array(maxNodes);
+
+        // Initialize free-list chain: 0 -> 1 -> 2 -> ... -> (maxNodes-1) -> -1
+        for (let i = 0; i < maxNodes - 1; i++) {
+            this.nextFree[i] = i + 1;
+        }
+        this.nextFree[maxNodes - 1] = -1;
+
+        // Pre-allocated scratch for `updateLeaf` re-inserts (zero-GC).
+        this._scratchAABB = new Float32Array(4);
+        // Pre-allocated scratch for `insertLeaves` per-box copy (zero-GC).
+        this._batchScratch = new Float32Array(4);
+    }
+
+    /**
+     * Root height in edges: -1 for an empty tree, 0 for a single leaf, else the
+     * longest root-to-leaf path. O(1) telemetry -- with rotations it tracks
+     * ~ceil(log2(leafCount)); watch it to see rebalancing hold under load. */
+    get height() {
+        return this.root === -1 ? -1 : this.heights[this.root];
+    }
+
+    /**
+     * Number of live leaves. O(1): every internal node has exactly two children,
+     * so a non-empty tree has `nodeCount === 2 * leafCount - 1`. */
+    get leafCount() {
+        return this.root === -1 ? 0 : (this.nodeCount + 1) >> 1;
+    }
+
+    /**
+     * Empties the tree back to its just-constructed state WITHOUT reallocating
+     * any buffer -- for scene reloads and the torture soak tier (which would
+     * otherwise allocate a fresh tree per cycle). **O(maxNodes)**, so it is not
+     * a hot-path call.
+     *
+     * The load-bearing line is `children.fill(FREED)`: it fails closed. Every
+     * slot's liveness marker is reset to FREED so any leaf handle held across a
+     * `clear()` now fails `_isLiveLeaf` -- `updateLeaf`/`removeLeaf`/`getBounds`
+     * on a stale id throw instead of mutating a slot the caller no longer owns.
+     * Skipping it would leave the old leaves' `children[id<<1] === -1` markers
+     * intact, so a pre-clear handle would masquerade as live and corrupt the
+     * fresh tree. The other SoA fields (bboxes/heights/userData/parents) are
+     * reset per node by `_allocateNode` on reuse, so they need no wipe here.
+     */
+    clear() {
+        this.children.fill(FREED);
+        for (let i = 0; i < this.maxNodes - 1; i++) {
+            this.nextFree[i] = i + 1;
+        }
+        this.nextFree[this.maxNodes - 1] = -1;
+        this.freeHead = 0;
+        this.nodeCount = 0;
+        this.root = -1;
+    }
+
+    /**
+     * Reads a leaf's stored FAT bounds into a caller-owned length-4 buffer and
+     * returns it -- the supported alternative to indexing the raw `bboxes` view.
+     * O(1). The values are exactly what is stored (f32), i.e. the fattened box
+     * from the last insert/re-insert, not the caller's original tight box.
+     *
+     * @param {number} leaf Live-leaf node id from `insertLeaf`/`updateLeaf`.
+     * @param {Float32Array} out4 Length-4 destination, written `[minX,minY,maxX,maxY]`.
+     * @returns {Float32Array} `out4`.
+     * @throws On an invalid, freed, or non-leaf (internal) handle -- fail closed,
+     *   like the other handle-taking methods.
+     */
+    getBounds(leaf, out4) {
+        if ((leaf >>> 0) !== leaf || leaf >= this.maxNodes || this.children[leaf << 1] !== -1) {
+            throw new Error('lite-bvh: getBounds on an invalid or non-leaf handle: ' + leaf);
+        }
+        const b = leaf << 2;
+        out4[0] = this.bboxes[b];
+        out4[1] = this.bboxes[b + 1];
+        out4[2] = this.bboxes[b + 2];
+        out4[3] = this.bboxes[b + 3];
+        return out4;
+    }
+
+    /** Internal O(1) allocation from the free-list. */
+    _allocateNode() {
+        if (this.freeHead === -1) {
+            throw new Error('lite-bvh: Max node capacity reached');
+        }
+        const nodeId = this.freeHead;
+        this.freeHead = this.nextFree[nodeId];
+
+        this.parents[nodeId] = -1;
+        const cIdx = nodeId << 1;
+        this.children[cIdx] = -1;
+        this.children[cIdx + 1] = -1;
+        this.heights[nodeId] = 0;
+        this.userData[nodeId] = -1;
+
+        this.nodeCount++;
+        return nodeId;
+    }
+
+    /** Internal O(1) deallocation back to the free-list. */
+    _freeNode(nodeId) {
+        // Mark the slot FREED so a stale handle to it fails validation instead
+        // of masquerading as a live leaf (B-04/B-06). _allocateNode resets it.
+        this.children[nodeId << 1] = FREED;
+        this.nextFree[nodeId] = this.freeHead;
+        this.freeHead = nodeId;
+        this.nodeCount--;
+    }
+
+    /**
+     * True iff `id` is a currently-allocated leaf. O(1); the guard behind every
+     * handle. `(id >>> 0) === id` rejects negatives, non-integers (e.g. 1.5) and
+     * ids >= 2^32 in one test before the range and leaf-marker checks.
+     */
+    _isLiveLeaf(id) {
+        return (id >>> 0) === id && id < this.maxNodes && this.children[id << 1] === -1;
+    }
+
+    /**
+     * The quarantine predicate (B-03/A-05). A box may enter the tree only if all
+     * four bounds are finite AND `minX <= maxX && minY <= maxY`. This is exactly
+     * `@zakkster/lite-aabb`'s `isValid` (1.1.0) -- copied inline, by contract, so
+     * the two packages agree on what "broken box" means with no runtime dep.
+     *
+     * Reading `a[3]` on a short buffer yields `undefined`, which is not finite,
+     * so a 3-element input is rejected here too (T4). A plain `Array` or
+     * `Float64Array` whose four values are finite and ordered is accepted and
+     * coerced to f32 on store; see the `updateLeaf` note on the f32 fast-path
+     * caveat for non-`Float32Array` inputs (B-11).
+     */
+    _isValidBox(a) {
+        return Number.isFinite(a[0]) && Number.isFinite(a[1]) &&
+               Number.isFinite(a[2]) && Number.isFinite(a[3]) &&
+               a[0] <= a[2] && a[1] <= a[3];
+    }
+
+    /**
+     * Inserts an AABB as a leaf, using the Surface Area Heuristic to pick a
+     * sibling. O(log n) average. Throws when capacity is exhausted.
+     *
+     * @param {Float32Array} leafAABB Length-4 box. Typically pre-fattened by
+     *   the caller (or `updateLeaf` will pre-fatten on re-insert).
+     * @param {number} data User-defined integer (e.g. ECS entity id) returned
+     *   by `query()` for matching leaves.
+     * @returns {number} The new node id. **Store this** to call `updateLeaf`
+     *   or `removeLeaf` later.
+     */
+    insertLeaf(leafAABB, data) {
+        // B-03/A-05: the quarantine door. Reject a non-finite or inverted box
+        // BEFORE any mutation, so poison can never reach `_refit` and propagate
+        // NaN up to the root (after which every query returns 0, forever). A NaN
+        // box is a valid Float32Array(4) that passes handle validation, so this
+        // is a separate door from the B1 handle checks.
+        if (!this._isValidBox(leafAABB)) {
+            throw new Error('lite-bvh: insertLeaf rejected a non-finite or inverted box');
+        }
+        // B-10: userData must be a non-negative int32. `-1` is the internal-node
+        // sentinel; `(data | 0) === data` rejects non-integers (3.7) and values
+        // outside int32 (2**31, which would wrap negative in the Int32Array);
+        // `data >= 0` reserves the whole negative half, sentinel included.
+        if ((data | 0) !== data || data < 0) {
+            throw new Error('lite-bvh: insertLeaf userData must be a non-negative int32, got ' + data);
+        }
+        // B-12: a view into the tree's own bboxes buffer aliases memory the SAH
+        // descent reads while `_mergeNodesToAABB` writes it -- undefined. Forbid
+        // it. A plain Array (`.buffer === undefined`) never equals bboxes.buffer.
+        if (leafAABB.buffer === this.bboxes.buffer) {
+            throw new Error('lite-bvh: insertLeaf leafAABB must not alias the tree bboxes buffer');
+        }
+
+        return this._insertPreValidated(leafAABB, data);
+    }
+
+    /**
+     * Bulk insert of `count` boxes packed contiguously in one `Float32Array`
+     * (`4*count` floats, box `i` at slots `4i..4i+3` -- the FORMAT.md packed
+     * layout). The broadphase-feeding path: it reads the buffer BY INDEX, so it
+     * allocates NOTHING per box (a `subarray` per box would defeat the point and
+     * fail the T6 gate).
+     *
+     * **Batch-atomic** (fail closed): every box, every `data`, the buffer-alias
+     * rule and total capacity are checked in a single pass BEFORE any mutation.
+     * If any element is bad the call throws and the tree is left byte-unchanged --
+     * never a partial batch. The per-box test is exactly `insertLeaf`'s door
+     * (finite/non-inverted box; non-negative int32 `data`; no `bboxes` aliasing).
+     *
+     * @param {Float32Array} packed `4*count` floats; box `i` at `[4i, 4i+3]`.
+     * @param {ArrayLike<number>} dataArray `count` userData ints, one per box.
+     * @param {number} count Number of boxes to insert.
+     * @returns {number} `count` (all boxes inserted, or the call threw).
+     * @throws Before any mutation on: a non-integer/negative `count`; a `packed`
+     *   or `dataArray` too short; a `packed` aliasing the tree's own `bboxes`; a
+     *   non-finite or inverted box; a bad `data`; or insufficient capacity.
+     */
+    insertLeaves(packed, dataArray, count) {
+        if ((count | 0) !== count || count < 0) {
+            throw new Error('lite-bvh: insertLeaves count must be a non-negative int32, got ' + count);
+        }
+        if (count === 0) return 0;
+        if (packed.length < (count << 2)) {
+            throw new Error('lite-bvh: insertLeaves packed buffer holds fewer than 4*count floats');
+        }
+        if (dataArray.length < count) {
+            throw new Error('lite-bvh: insertLeaves dataArray holds fewer than count entries');
+        }
+        // B-12 at the batch level: the packed buffer must not be a view into the
+        // tree's own bboxes (the SAH descent reads it while _refit writes it).
+        if (packed.buffer === this.bboxes.buffer) {
+            throw new Error('lite-bvh: insertLeaves packed must not alias the tree bboxes buffer');
+        }
+        // Whole-batch capacity, up front: `count` leaves add at most `2*count`
+        // nodes (each leaf may create an internal parent; the first into an empty
+        // tree adds only one). Conservative by <=1 -- fail closed, no free-list walk.
+        if (this.nodeCount + (count << 1) > this.maxNodes) {
+            throw new Error('lite-bvh: insertLeaves needs up to ' + (count << 1) +
+                ' free nodes; capacity ' + this.maxNodes + ' would be exceeded');
+        }
+        // Per-element quarantine, still BEFORE any mutation (batch-atomic): a
+        // single bad box or data value aborts with the tree untouched. Inlined
+        // `_isValidBox` on the packed slots so no per-box view is created.
+        for (let k = 0, j = 0; k < count; k++, j += 4) {
+            if (!(Number.isFinite(packed[j]) && Number.isFinite(packed[j + 1]) &&
+                  Number.isFinite(packed[j + 2]) && Number.isFinite(packed[j + 3]) &&
+                  packed[j] <= packed[j + 2] && packed[j + 1] <= packed[j + 3])) {
+                throw new Error('lite-bvh: insertLeaves rejected a non-finite or inverted box at index ' + k);
+            }
+            const d = dataArray[k];
+            if ((d | 0) !== d || d < 0) {
+                throw new Error('lite-bvh: insertLeaves userData must be a non-negative int32 at index ' +
+                    k + ', got ' + d);
+            }
+        }
+        // All validated: insert. Copy each box into the reused scratch (zero
+        // per-box allocation) and hand it to the shared, already-validated core.
+        const s = this._batchScratch;
+        for (let k = 0, j = 0; k < count; k++, j += 4) {
+            s[0] = packed[j]; s[1] = packed[j + 1]; s[2] = packed[j + 2]; s[3] = packed[j + 3];
+            this._insertPreValidated(s, dataArray[k]);
+        }
+        return count;
+    }
+
+    /**
+     * Inserts a box that has ALREADY cleared the quarantine door and the
+     * userData / alias checks. Shared by `insertLeaf` (single) and `insertLeaves`
+     * (bulk) so the SAH descent + refit live in one place. `box4` is read by
+     * index `[0..3]` -- the caller's `Float32Array` on the single path, the reused
+     * `_batchScratch` on the bulk path. Still does its own atomic capacity check
+     * (a redundant no-op when the bulk caller pre-reserved).
+     *
+     * @param {ArrayLike<number>} box4
+     * @param {number} data
+     * @returns {number} the new leaf id
+     */
+    _insertPreValidated(box4, data) {
+        // B-01: reserve capacity atomically, BEFORE the first mutation. A
+        // non-empty tree needs two free nodes (the leaf plus a new internal
+        // parent); an empty tree needs one. Checking up front means a capacity
+        // failure throws at the boundary and leaves the tree byte-unchanged and
+        // still valid -- as the README promises -- instead of consuming the leaf
+        // and then throwing on the parent, orphaning a node forever.
+        if (this.root === -1) {
+            if (this.freeHead === -1) {
+                throw new Error('lite-bvh: Max node capacity reached');
+            }
+        } else if (this.freeHead === -1 || this.nextFree[this.freeHead] === -1) {
+            throw new Error('lite-bvh: Max node capacity reached');
+        }
+
+        const leaf = this._allocateNode();
+
+        const bIdx = leaf << 2;
+        this.bboxes[bIdx]     = box4[0];
+        this.bboxes[bIdx + 1] = box4[1];
+        this.bboxes[bIdx + 2] = box4[2];
+        this.bboxes[bIdx + 3] = box4[3];
+        this.userData[leaf] = data;
+
+        if (this.root === -1) {
+            this.root = leaf;
+            return leaf;
+        }
+
+        // 1. Find the best sibling for the new leaf via SAH descent.
+        let searchNode = this.root;
+
+        while (this.children[searchNode << 1] !== -1) {
+            const left  = this.children[searchNode << 1];
+            const right = this.children[(searchNode << 1) + 1];
+
+            const nodeArea = this._perimeterNode(searchNode);
+            const combinedArea = this._mergedPerimeter(searchNode, box4);
+            const cost = 2.0 * combinedArea;
+            const inheritanceCost = 2.0 * (combinedArea - nodeArea);
+
+            // Descent cost for left child.
+            let costLeft;
+            if (this.children[left << 1] === -1) {
+                costLeft = this._mergedPerimeter(left, box4) + inheritanceCost;
+            } else {
+                const oldArea = this._perimeterNode(left);
+                const newArea = this._mergedPerimeter(left, box4);
+                costLeft = (newArea - oldArea) + inheritanceCost;
+            }
+
+            // Descent cost for right child.
+            let costRight;
+            if (this.children[right << 1] === -1) {
+                costRight = this._mergedPerimeter(right, box4) + inheritanceCost;
+            } else {
+                const oldArea = this._perimeterNode(right);
+                const newArea = this._mergedPerimeter(right, box4);
+                costRight = (newArea - oldArea) + inheritanceCost;
+            }
+
+            // If neither descent is cheaper than making `searchNode` the sibling, stop.
+            if (cost < costLeft && cost < costRight) break;
+            searchNode = costLeft < costRight ? left : right;
+        }
+
+        const sibling = searchNode;
+
+        // 2. Create a new parent above the sibling.
+        const oldParent = this.parents[sibling];
+        const newParent = this._allocateNode();
+
+        this.parents[newParent] = oldParent;
+        this.userData[newParent] = -1; // internal nodes carry no user data
+
+        this._mergeNodesToAABB(newParent, sibling, box4);
+        this.heights[newParent] = this.heights[sibling] + 1;
+
+        if (oldParent !== -1) {
+            const opC = oldParent << 1;
+            if (this.children[opC] === sibling) {
+                this.children[opC] = newParent;
+            } else {
+                this.children[opC + 1] = newParent;
+            }
+        } else {
+            this.root = newParent;
+        }
+
+        const npC = newParent << 1;
+        this.children[npC] = sibling;
+        this.children[npC + 1] = leaf;
+        this.parents[sibling] = newParent;
+        this.parents[leaf] = newParent;
+
+        // 3. Walk back up refitting AABBs and heights.
+        this._refit(leaf);
+
+        return leaf;
+    }
+
+    /**
+     * Iterative range query — finds every leaf whose AABB intersects `queryAABB`.
+     * Zero allocations: matches are written into the caller-provided `outBuffer`.
+     *
+     * `query` is a read-only probe: it never writes the tree, so it needs no
+     * quarantine door and its hot inner loop takes no validation. A degenerate
+     * query box has well-defined, pinned behaviour rather than a silent trap --
+     * a NaN-bearing box and the canonical empty sentinel `[Inf,Inf,-Inf,-Inf]`
+     * both return 0 hits (every bbox comparison is `false`). See torture T1.
+     *
+     * @param {Float32Array} queryAABB Length-4 box to test against.
+     * @param {Int32Array} outBuffer User-provided buffer; will receive the
+     *   matching leaves' `userData` values. **The query stops early** when
+     *   the buffer fills (`hitCount === outBuffer.length`), so size it to
+     *   match your worst-case batch (e.g. visible entities per frame).
+     * @returns {number} Hit count. Use `outBuffer.subarray(0, hitCount)` to
+     *   read the filled prefix.
+     * @throws Only if the traversal stack overflows -- impossible for a
+     *   well-formed tree (rotations bound height to O(log n), the stack holds
+     *   `height + 1`), so a throw here signals corruption. Fail-closed: it never
+     *   silently grows the stack inside the hot loop (the old B-08 behaviour).
+     */
+    query(queryAABB, outBuffer) {
+        if (this.root === -1) return 0;
+
+        let stackPtr = 0;
+        let hitCount = 0;
+        let stack = this.queryStack;
+        const maxHits = outBuffer.length;
+
+        stack[stackPtr++] = this.root;
+
+        const qMinX = queryAABB[0], qMinY = queryAABB[1];
+        const qMaxX = queryAABB[2], qMaxY = queryAABB[3];
+
+        while (stackPtr > 0) {
+            const nodeId = stack[--stackPtr];
+            const bIdx = nodeId << 2;
+
+            if (this.bboxes[bIdx] <= qMaxX && this.bboxes[bIdx + 2] >= qMinX &&
+                this.bboxes[bIdx + 1] <= qMaxY && this.bboxes[bIdx + 3] >= qMinY) {
+
+                const cIdx = nodeId << 1;
+                const left = this.children[cIdx];
+
+                if (left === -1) {
+                    // B-02: check BEFORE the write so a full -- or zero-length --
+                    // buffer never records a phantom hit and never reports one.
+                    if (hitCount >= maxHits) break;
+                    outBuffer[hitCount++] = this.userData[nodeId];
+                } else {
+                    // Fail-closed (B-08): the stack holds at most `height + 1`
+                    // ids, and rotations bound height to O(log n), so this guard
+                    // never trips for a well-formed tree. If it does, the tree is
+                    // corrupt/degenerate beyond what rotations allow -- throw
+                    // loudly rather than silently allocating a bigger stack in the
+                    // hot loop (the old behaviour, which broke the zero-GC law by
+                    // data alone). The check stays: dropping it would make an
+                    // overflow a silent typed-array no-op -> lost nodes -> wrong
+                    // hit counts, which is worse than a throw.
+                    if (stackPtr + 2 > stack.length) {
+                        throw new Error('lite-bvh: query stack overflow at depth ' +
+                            stackPtr + ' (stack ' + stack.length + ') -- tree is degenerate; ' +
+                            'call validate()');
+                    }
+
+                    stack[stackPtr++] = left;
+                    stack[stackPtr++] = this.children[cIdx + 1];
+                }
+            }
+        }
+
+        return hitCount;
+    }
+
+    /**
+     * Point-pick query -- every leaf whose fat bounds contain `(x, y)`. The
+     * picking shortcut: no AABB to build for a mouse/touch hit-test. Identical
+     * in every other respect to `query` -- iterative, zero-allocation, writes
+     * `userData` into `outBuffer`, stops early when it fills, same touching-edge
+     * convention (a point on a boundary counts, `<=`/`>=`), same fail-closed
+     * stack (it REUSES `queryStack`, so it inherits B3's no-grow policy and is
+     * part of the T6 alloc gate).
+     *
+     * By construction this equals `query([x, y, x, y], outBuffer)`: containing a
+     * point is overlapping a zero-size box at that point. Non-finite `x`/`y`
+     * make every comparison false and return 0 -- no throw, matching `query`.
+     *
+     * @param {number} x
+     * @param {number} y
+     * @param {Int32Array} outBuffer Receives matching leaves' `userData`.
+     * @returns {number} Hit count; read `outBuffer.subarray(0, count)`.
+     * @throws Only on a traversal-stack overflow -- impossible for a well-formed
+     *   tree (see `query`); a fail-closed corruption signal, never an allocation.
+     */
+    queryPoint(x, y, outBuffer) {
+        if (this.root === -1) return 0;
+
+        let stackPtr = 0;
+        let hitCount = 0;
+        const stack = this.queryStack;
+        const maxHits = outBuffer.length;
+
+        stack[stackPtr++] = this.root;
+
+        while (stackPtr > 0) {
+            const nodeId = stack[--stackPtr];
+            const bIdx = nodeId << 2;
+
+            if (this.bboxes[bIdx] <= x && this.bboxes[bIdx + 2] >= x &&
+                this.bboxes[bIdx + 1] <= y && this.bboxes[bIdx + 3] >= y) {
+
+                const cIdx = nodeId << 1;
+                const left = this.children[cIdx];
+
+                if (left === -1) {
+                    if (hitCount >= maxHits) break;
+                    outBuffer[hitCount++] = this.userData[nodeId];
+                } else {
+                    if (stackPtr + 2 > stack.length) {
+                        throw new Error('lite-bvh: queryPoint stack overflow at depth ' +
+                            stackPtr + ' (stack ' + stack.length + ') -- tree is degenerate; ' +
+                            'call validate()');
+                    }
+                    stack[stackPtr++] = left;
+                    stack[stackPtr++] = this.children[cIdx + 1];
+                }
+            }
+        }
+
+        return hitCount;
+    }
+
+    /**
+     * Segment query -- every leaf whose fat bounds the segment `(p0x,p0y)`->
+     * `(p1x,p1y)` touches or crosses. A slab test clamped to the segment
+     * (`t` in `[0, 1]`), not an infinite ray. Iterative, zero-allocation, writes
+     * `userData` into `outBuffer`, stops early when it fills, REUSES `queryStack`
+     * (so it too is under the no-grow policy and the T6 gate).
+     *
+     * Descending only into node boxes the segment hits is complete: a parent box
+     * contains both children, so any segment reaching a leaf reaches every
+     * ancestor box first.
+     *
+     * **No callback form (by design).** A per-hit callback re-enters user code
+     * mid-traversal while `queryStack` is held; a nested query from that callback
+     * would corrupt the shared stack, turning reentrant-safety from true into
+     * silently-false. Hits go into a caller buffer like every other query here.
+     * See decisions/0004-query-kinds.md.
+     *
+     * A zero-length segment (`p0 === p1`) degenerates to `queryPoint(p0x, p0y)`.
+     * Non-finite endpoints return 0 hits, not a throw (read-only probe).
+     *
+     * @param {number} p0x
+     * @param {number} p0y
+     * @param {number} p1x
+     * @param {number} p1y
+     * @param {Int32Array} outBuffer Receives matching leaves' `userData`.
+     * @returns {number} Hit count; read `outBuffer.subarray(0, count)`.
+     * @throws Only on a traversal-stack overflow -- impossible for a well-formed
+     *   tree (see `query`); a fail-closed corruption signal, never an allocation.
+     */
+    raycast(p0x, p0y, p1x, p1y, outBuffer) {
+        if (this.root === -1) return 0;
+
+        // Read-only probe (matches `query`): a non-finite endpoint returns 0, not
+        // a throw. Guarded ONCE up front, not per node -- the slab arithmetic does
+        // not self-reject NaN the way `query`'s comparisons do (a NaN `t` leaves
+        // tmin=0/tmax=1 unclamped and would spuriously match every leaf), so the
+        // door has to be explicit. Off the per-hit path, so it costs the traversal
+        // nothing.
+        if (!(Number.isFinite(p0x) && Number.isFinite(p0y) &&
+              Number.isFinite(p1x) && Number.isFinite(p1y))) {
+            return 0;
+        }
+
+        const dx = p1x - p0x;
+        const dy = p1y - p0y;
+
+        // Explicit per-axis zero-direction handling rather than the branchless
+        // `1/d` slab trick: when the segment starts exactly on a slab boundary
+        // the reciprocal form computes `0/0 === NaN`, and a NaN silently defeats
+        // the tmin/tmax clamp (every `NaN <`/`NaN >` is false). Branches are free
+        // here (no allocation); NaN correctness is not. See decision 0004.
+        const invDx = dx !== 0 ? 1 / dx : 0;
+        const invDy = dy !== 0 ? 1 / dy : 0;
+
+        let stackPtr = 0;
+        let hitCount = 0;
+        const stack = this.queryStack;
+        const maxHits = outBuffer.length;
+
+        stack[stackPtr++] = this.root;
+
+        while (stackPtr > 0) {
+            const nodeId = stack[--stackPtr];
+            const b = nodeId << 2;
+
+            // Slab clip against this node's box over t in [0, 1].
+            let tmin = 0;
+            let tmax = 1;
+            let hit = true;
+
+            // X slabs.
+            if (dx !== 0) {
+                let t1 = (this.bboxes[b]     - p0x) * invDx;
+                let t2 = (this.bboxes[b + 2] - p0x) * invDx;
+                if (t1 > t2) { const tmp = t1; t1 = t2; t2 = tmp; }
+                if (t1 > tmin) tmin = t1;
+                if (t2 < tmax) tmax = t2;
+                if (tmin > tmax) hit = false;
+            } else if (p0x < this.bboxes[b] || p0x > this.bboxes[b + 2]) {
+                hit = false;
+            }
+
+            // Y slabs.
+            if (hit) {
+                if (dy !== 0) {
+                    let t1 = (this.bboxes[b + 1] - p0y) * invDy;
+                    let t2 = (this.bboxes[b + 3] - p0y) * invDy;
+                    if (t1 > t2) { const tmp = t1; t1 = t2; t2 = tmp; }
+                    if (t1 > tmin) tmin = t1;
+                    if (t2 < tmax) tmax = t2;
+                    if (tmin > tmax) hit = false;
+                } else if (p0y < this.bboxes[b + 1] || p0y > this.bboxes[b + 3]) {
+                    hit = false;
+                }
+            }
+
+            if (hit) {
+                const cIdx = nodeId << 1;
+                const left = this.children[cIdx];
+
+                if (left === -1) {
+                    if (hitCount >= maxHits) break;
+                    outBuffer[hitCount++] = this.userData[nodeId];
+                } else {
+                    if (stackPtr + 2 > stack.length) {
+                        throw new Error('lite-bvh: raycast stack overflow at depth ' +
+                            stackPtr + ' (stack ' + stack.length + ') -- tree is degenerate; ' +
+                            'call validate()');
+                    }
+                    stack[stackPtr++] = left;
+                    stack[stackPtr++] = this.children[cIdx + 1];
+                }
+            }
+        }
+
+        return hitCount;
+    }
+
+    /**
+     * Removes a leaf, heals the gap by promoting its sibling, and returns
+     * the node ids (leaf + parent) to the free-list. O(log n).
+     *
+     * @param {number} leaf Node id returned from a previous `insertLeaf`.
+     */
+    removeLeaf(leaf) {
+        // B-04/B-05: reject anything that is not a live leaf -- non-integer,
+        // negative, out of range, an internal node, or an already-freed slot --
+        // before touching the tree. Inlined `_isLiveLeaf`: `(leaf >>> 0) !== leaf`
+        // folds every non-uint32 into the reject path, so `children[leaf << 1]`
+        // is only read for an in-range integer id.
+        if ((leaf >>> 0) !== leaf || leaf >= this.maxNodes || this.children[leaf << 1] !== -1) {
+            throw new Error('lite-bvh: removeLeaf on an invalid or non-leaf handle: ' + leaf);
+        }
+
+        if (leaf === this.root) {
+            this.root = -1;
+            this._freeNode(leaf);
+            return;
+        }
+
+        const parent = this.parents[leaf];
+        const grandParent = this.parents[parent];
+
+        // Find the sibling.
+        const pIdx = parent << 1;
+        const sibling = this.children[pIdx] === leaf
+            ? this.children[pIdx + 1]
+            : this.children[pIdx];
+
+        if (grandParent !== -1) {
+            // Promote sibling: grandParent now points directly at it.
+            const gpIdx = grandParent << 1;
+            if (this.children[gpIdx] === parent) {
+                this.children[gpIdx] = sibling;
+            } else {
+                this.children[gpIdx + 1] = sibling;
+            }
+            this.parents[sibling] = grandParent;
+            this._freeNode(parent);
+
+            // Refit from `sibling`, whose parent is now grandParent, so the walk
+            // recomputes grandParent ITSELF and up. `_refit(grandParent)` would
+            // start one level too high and leave grandParent's height and bbox
+            // stale after the promotion -- harmless for a bbox (it stays a
+            // superset, so queries only over-descend) but a stale height feeds
+            // `_balance` a wrong rotation decision, so it must be correct here.
+            this._refit(sibling);
+        } else {
+            // Parent was the root; sibling becomes the new root.
+            this.root = sibling;
+            this.parents[sibling] = -1;
+            this._freeNode(parent);
+        }
+
+        this._freeNode(leaf);
+    }
+
+    /**
+     * Updates a moving leaf. Fast path (O(1)): if the new tight bounds still
+     * fit inside the existing fat bounds, nothing changes — the original
+     * `leaf` id is returned. Slow path (O(log n)): the leaf is removed,
+     * its bounds are fattened by `margin`, and it's re-inserted; a new node
+     * id is returned. **Always reassign your stored handle from the return
+     * value** — the leaf id may change.
+     *
+     * Pass a `Float32Array`. The fast path compares `newAABB` directly against
+     * the f32-rounded stored bounds; a `Float64Array` value sitting within one
+     * f32 ulp of the fat boundary can take the fast path yet lie just outside
+     * the stored box, a silent query miss (B-11). Non-`Float32Array` inputs are
+     * accepted and coerced on the SLOW path, never rejected -- the fast path
+     * stays type-agnostic and allocation-free.
+     *
+     * @param {number} leaf Current node id.
+     * @param {Float32Array} newAABB The exact, tight bounds of the moved object.
+     * @param {number} margin Fattening to apply on the slow path. Larger margin =
+     *   fewer re-inserts, larger query results. Common values: 0.1–4 world units.
+     * @returns {number} The active node id (possibly === `leaf`, possibly different).
+     */
+    updateLeaf(leaf, newAABB, margin) {
+        // B-06: reject an invalid, freed, or non-leaf handle up front so a stale
+        // id cannot resurrect a removed entity. This is the ONLY validation on
+        // the fast path: an integer/range test and one child-slot load (the
+        // tri-state leaf sentinel). No traversal, no allocation -- measured within
+        // noise of the pre-1.0.2 baseline (see decisions/0001-handle-validation.md).
+        if ((leaf >>> 0) !== leaf || leaf >= this.maxNodes || this.children[leaf << 1] !== -1) {
+            throw new Error('lite-bvh: updateLeaf on an invalid or non-leaf handle: ' + leaf);
+        }
+
+        const b = leaf << 2;
+
+        // Fast path: tight bounds still inside fat bounds.
+        if (this.bboxes[b]     <= newAABB[0] &&
+            this.bboxes[b + 1] <= newAABB[1] &&
+            this.bboxes[b + 2] >= newAABB[2] &&
+            this.bboxes[b + 3] >= newAABB[3]) {
+            return leaf;
+        }
+
+        // Slow path: fatten into scratch and validate the fattened box BEFORE
+        // removing the leaf, so a poison update is atomic -- it throws with the
+        // leaf still exactly where it was, not removed-then-orphaned. This also
+        // catches a non-finite `margin` and A-05's negative-margin inversion (a
+        // valid tight box + a margin more negative than half its width inverts).
+        this._scratchAABB[0] = newAABB[0] - margin;
+        this._scratchAABB[1] = newAABB[1] - margin;
+        this._scratchAABB[2] = newAABB[2] + margin;
+        this._scratchAABB[3] = newAABB[3] + margin;
+        if (!this._isValidBox(this._scratchAABB)) {
+            throw new Error('lite-bvh: updateLeaf rejected a non-finite or inverted fattened box');
+        }
+
+        const data = this.userData[leaf];
+        this.removeLeaf(leaf);
+        return this.insertLeaf(this._scratchAABB, data);
+    }
+
+    // ---- Internal helpers ----
+
+    _perimeterNode(nodeId) {
+        const b = nodeId << 2;
+        return 2 * ((this.bboxes[b + 2] - this.bboxes[b]) +
+                    (this.bboxes[b + 3] - this.bboxes[b + 1]));
+    }
+
+    _mergedPerimeter(nodeId, aabb) {
+        const b = nodeId << 2;
+        const minX = Math.min(this.bboxes[b],     aabb[0]);
+        const minY = Math.min(this.bboxes[b + 1], aabb[1]);
+        const maxX = Math.max(this.bboxes[b + 2], aabb[2]);
+        const maxY = Math.max(this.bboxes[b + 3], aabb[3]);
+        return 2 * ((maxX - minX) + (maxY - minY));
+    }
+
+    _mergeNodesToAABB(destId, sourceId, aabb) {
+        const d = destId << 2;
+        const s = sourceId << 2;
+        this.bboxes[d]     = Math.min(this.bboxes[s],     aabb[0]);
+        this.bboxes[d + 1] = Math.min(this.bboxes[s + 1], aabb[1]);
+        this.bboxes[d + 2] = Math.max(this.bboxes[s + 2], aabb[2]);
+        this.bboxes[d + 3] = Math.max(this.bboxes[s + 3], aabb[3]);
+    }
+
+    /** Merge the bboxes of nodes `aId` and `bId` into node `destId`. */
+    _combine(destId, aId, bId) {
+        const d = destId << 2, a = aId << 2, b = bId << 2;
+        this.bboxes[d]     = Math.min(this.bboxes[a],     this.bboxes[b]);
+        this.bboxes[d + 1] = Math.min(this.bboxes[a + 1], this.bboxes[b + 1]);
+        this.bboxes[d + 2] = Math.max(this.bboxes[a + 2], this.bboxes[b + 2]);
+        this.bboxes[d + 3] = Math.max(this.bboxes[a + 3], this.bboxes[b + 3]);
+    }
+
+    /**
+     * One Box2D-style rotation to rebalance the subtree rooted at `iA` (B-07).
+     * A faithful port of Erin Catto's `b2DynamicTree::Balance`: if A's two
+     * subtrees differ in height by more than one, the taller grandchild is
+     * rotated up above A. Returns the (possibly new) subtree root -- `iA`
+     * itself when no rotation was needed -- after fixing every moved node's
+     * parent link, bbox and height. Called once per ancestor by `_refit`, which
+     * keeps the whole tree's height O(log n) regardless of insert order.
+     *
+     * The two branches (rotate C up / rotate B up) are written out in full
+     * rather than folded into a shared helper: this is the insert/remove path,
+     * not the fast path, and staying line-for-line with the reference is worth
+     * more here than brevity.
+     */
+    _balance(iA) {
+        const cA = iA << 1;
+        // A leaf (child1 === -1) or a height-1 node cannot be unbalanced.
+        if (this.children[cA] === -1 || this.heights[iA] < 2) return iA;
+
+        const iB = this.children[cA];
+        const iC = this.children[cA + 1];
+        const balance = this.heights[iC] - this.heights[iB];
+
+        // --- Rotate C up (right child taller) ---
+        if (balance > 1) {
+            const cC = iC << 1;
+            const iF = this.children[cC];
+            const iG = this.children[cC + 1];
+
+            // Swap A and C: C takes A's place, A becomes C's left child.
+            this.children[cC] = iA;
+            this.parents[iC] = this.parents[iA];
+            this.parents[iA] = iC;
+
+            // A's old parent (now C's parent) must point at C.
+            const pC = this.parents[iC];
+            if (pC !== -1) {
+                const cP = pC << 1;
+                if (this.children[cP] === iA) this.children[cP] = iC;
+                else this.children[cP + 1] = iC;
+            } else {
+                this.root = iC;
+            }
+
+            // Promote C's taller grandchild; the other stays under A.
+            if (this.heights[iF] > this.heights[iG]) {
+                this.children[cC + 1] = iF;
+                this.children[cA + 1] = iG;
+                this.parents[iG] = iA;
+                this._combine(iA, iB, iG);
+                this._combine(iC, iA, iF);
+                this.heights[iA] = 1 + Math.max(this.heights[iB], this.heights[iG]);
+                this.heights[iC] = 1 + Math.max(this.heights[iA], this.heights[iF]);
+            } else {
+                this.children[cC + 1] = iG;
+                this.children[cA + 1] = iF;
+                this.parents[iF] = iA;
+                this._combine(iA, iB, iF);
+                this._combine(iC, iA, iG);
+                this.heights[iA] = 1 + Math.max(this.heights[iB], this.heights[iF]);
+                this.heights[iC] = 1 + Math.max(this.heights[iA], this.heights[iG]);
+            }
+            return iC;
+        }
+
+        // --- Rotate B up (left child taller) ---
+        if (balance < -1) {
+            const cB = iB << 1;
+            const iD = this.children[cB];
+            const iE = this.children[cB + 1];
+
+            // Swap A and B: B takes A's place, A becomes B's right child.
+            this.children[cB + 1] = iA;
+            this.parents[iB] = this.parents[iA];
+            this.parents[iA] = iB;
+
+            const pB = this.parents[iB];
+            if (pB !== -1) {
+                const cP = pB << 1;
+                if (this.children[cP] === iA) this.children[cP] = iB;
+                else this.children[cP + 1] = iB;
+            } else {
+                this.root = iB;
+            }
+
+            // Promote B's taller grandchild; the other stays under A.
+            if (this.heights[iD] > this.heights[iE]) {
+                this.children[cB] = iD;
+                this.children[cA] = iE;
+                this.parents[iE] = iA;
+                this._combine(iA, iC, iE);
+                this._combine(iB, iA, iD);
+                this.heights[iA] = 1 + Math.max(this.heights[iC], this.heights[iE]);
+                this.heights[iB] = 1 + Math.max(this.heights[iA], this.heights[iD]);
+            } else {
+                this.children[cB] = iE;
+                this.children[cA] = iD;
+                this.parents[iD] = iA;
+                this._combine(iA, iC, iD);
+                this._combine(iB, iA, iE);
+                this.heights[iA] = 1 + Math.max(this.heights[iC], this.heights[iD]);
+                this.heights[iB] = 1 + Math.max(this.heights[iA], this.heights[iE]);
+            }
+            return iB;
+        }
+
+        return iA;
+    }
+
+    _refit(nodeId) {
+        let index = this.parents[nodeId];
+        while (index !== -1) {
+            // Rebalance first (Box2D order): `_balance` reads the children's
+            // heights -- which are current at this point -- and recomputes the
+            // rotated nodes. `index` may change to the subtree's new root.
+            index = this._balance(index);
+
+            const cIdx  = index << 1;
+            const left  = this.children[cIdx];
+            const right = this.children[cIdx + 1];
+
+            const iB = index << 2;
+            const lB = left  << 2;
+            const rB = right << 2;
+
+            this.bboxes[iB]     = Math.min(this.bboxes[lB],     this.bboxes[rB]);
+            this.bboxes[iB + 1] = Math.min(this.bboxes[lB + 1], this.bboxes[rB + 1]);
+            this.bboxes[iB + 2] = Math.max(this.bboxes[lB + 2], this.bboxes[rB + 2]);
+            this.bboxes[iB + 3] = Math.max(this.bboxes[lB + 3], this.bboxes[rB + 3]);
+
+            this.heights[index] = 1 + Math.max(this.heights[left], this.heights[right]);
+
+            index = this.parents[index];
+        }
+    }
+
+    /**
+     * Full structural self-check. **O(n); debug and test only -- never call it
+     * on a hot path.** Throws an `Error` naming the first offending node;
+     * returns `true` when the tree is internally consistent. Verifies:
+     *   - free-list conservation: `nodeCount + freeListLength === maxNodes`;
+     *   - the free-list is acyclic and in range;
+     *   - every parent/child link is reciprocal;
+     *   - `heights[n] === 1 + max(child heights)`;
+     *   - each internal node's bbox contains both children's bboxes;
+     *   - leaves have no children; internal nodes carry `userData === -1`;
+     *   - the number of reachable nodes equals `nodeCount`.
+     *
+     * @returns {true}
+     */
+    validate() {
+        const max = this.maxNodes;
+
+        // 1. Free-list: acyclic, in range, and conserving.
+        let free = 0;
+        for (let h = this.freeHead, guard = 0; h !== -1; h = this.nextFree[h], guard++) {
+            if (guard > max) throw new Error('lite-bvh: validate: free-list is cyclic');
+            if ((h >>> 0) >= max) throw new Error('lite-bvh: validate: free id out of range: ' + h);
+            free++;
+        }
+        if (this.nodeCount + free !== max) {
+            throw new Error('lite-bvh: validate: conservation violated: nodeCount ' +
+                this.nodeCount + ' + free ' + free + ' != maxNodes ' + max);
+        }
+
+        // 2. Empty tree.
+        if (this.root === -1) {
+            if (this.nodeCount !== 0) {
+                throw new Error('lite-bvh: validate: empty tree has nodeCount ' + this.nodeCount);
+            }
+            return true;
+        }
+        if ((this.root >>> 0) >= max) throw new Error('lite-bvh: validate: root out of range: ' + this.root);
+        if (this.parents[this.root] !== -1) throw new Error('lite-bvh: validate: root ' + this.root + ' has a parent');
+
+        // 3. DFS from the root: links, heights, bbox containment, node markers.
+        let reachable = 0;
+        const stack = [this.root];
+        while (stack.length) {
+            const n = stack.pop();
+            reachable++;
+            if (reachable > max) throw new Error('lite-bvh: validate: tree has a cycle');
+
+            // B-03 poison detector: every stored bbox must be finite and ordered.
+            // The containment test below is NaN-blind (`NaN > NaN` is false), so a
+            // poisoned node would slip past it -- this catch names the offender.
+            const vb = n << 2;
+            if (!(Number.isFinite(this.bboxes[vb]) && Number.isFinite(this.bboxes[vb + 1]) &&
+                  Number.isFinite(this.bboxes[vb + 2]) && Number.isFinite(this.bboxes[vb + 3]) &&
+                  this.bboxes[vb] <= this.bboxes[vb + 2] && this.bboxes[vb + 1] <= this.bboxes[vb + 3])) {
+                throw new Error('lite-bvh: validate: node ' + n + ' has a non-finite or inverted bbox');
+            }
+
+            const cIdx = n << 1;
+            const l = this.children[cIdx];
+            const r = this.children[cIdx + 1];
+
+            if (l === -1) {
+                // Leaf.
+                if (r !== -1) throw new Error('lite-bvh: validate: half-leaf node ' + n);
+                if (this.heights[n] !== 0) {
+                    throw new Error('lite-bvh: validate: leaf ' + n + ' has height ' + this.heights[n]);
+                }
+                continue;
+            }
+
+            // Internal node.
+            if ((l >>> 0) >= max || (r >>> 0) >= max) {
+                throw new Error('lite-bvh: validate: node ' + n + ' has an out-of-range child');
+            }
+            if (this.parents[l] !== n || this.parents[r] !== n) {
+                throw new Error('lite-bvh: validate: non-reciprocal parent link at node ' + n);
+            }
+            if (this.userData[n] !== -1) {
+                throw new Error('lite-bvh: validate: internal node ' + n + ' carries userData ' + this.userData[n]);
+            }
+            const expectH = 1 + Math.max(this.heights[l], this.heights[r]);
+            if (this.heights[n] !== expectH) {
+                throw new Error('lite-bvh: validate: node ' + n + ' height ' + this.heights[n] + ' != ' + expectH);
+            }
+            const nb = n << 2, lb = l << 2, rb = r << 2;
+            if (this.bboxes[nb]     > Math.min(this.bboxes[lb],     this.bboxes[rb]) ||
+                this.bboxes[nb + 1] > Math.min(this.bboxes[lb + 1], this.bboxes[rb + 1]) ||
+                this.bboxes[nb + 2] < Math.max(this.bboxes[lb + 2], this.bboxes[rb + 2]) ||
+                this.bboxes[nb + 3] < Math.max(this.bboxes[lb + 3], this.bboxes[rb + 3])) {
+                throw new Error('lite-bvh: validate: node ' + n + ' bbox does not contain its children');
+            }
+
+            stack.push(l, r);
+        }
+
+        if (reachable !== this.nodeCount) {
+            throw new Error('lite-bvh: validate: reachable ' + reachable + ' != nodeCount ' + this.nodeCount);
+        }
+        return true;
+    }
+}
+
+/**
+ * Package version. Kept in three-place sync: this constant, `package.json`
+ * `version`, and the top entry of `CHANGELOG.md`. A release that touches one
+ * without the other two is a broken release.
+ */
+const BVH_VERSION = '2.0.0';
+
+/**
+ * The version of the shared FORMAT contract (see FORMAT.md), NOT the package
+ * version. `@zakkster/lite-aabb` exports the identical constant; the two packages
+ * compare it for equality to detect a format skew. It is an integer compared for
+ * equality, on a separate axis from `VERSION` -- do not sync it to semver. Copied
+ * inline (not imported) so this package keeps zero runtime dependencies; the two
+ * are held in agreement by the conformance test, not by a dependency edge.
+ * Bumps only when the buffer layout itself changes (decisions/0005). (v2.0.0+)
+ */
+const BVH_FORMAT_VERSION = 1;
+
+
+    /* ============================================================================
+     * Demo harness. Every buffer it touches per frame is pre-allocated here at
+     * setup; the render loop and the library calls allocate nothing, which is what
+     * the "0 B / frame" badge and the flat frame-time trace are claiming.
+     * ==========================================================================*/
+    (function () {
+        "use strict";
+
+        const aabb = aabb2; // alias the frozen namespace
+
+        // ---- format handshake (a real equality check on the two inlined constants)
+        const fmtOk = (AABB_FORMAT_VERSION === BVH_FORMAT_VERSION);
+        document.getElementById("fmtV").textContent = BVH_FORMAT_VERSION;
+        document.getElementById("verA").textContent = AABB_VERSION;
+        document.getElementById("verB").textContent = BVH_VERSION;
+        if (!fmtOk) {
+            const b = document.getElementById("fmtBadge");
+            b.classList.add("bad");
+            b.innerHTML = '<span class="dot"></span> FORMAT SKEW: aabb v' + AABB_FORMAT_VERSION + ' != bvh v' + BVH_FORMAT_VERSION;
+        }
+
+        // ---- capacity + pre-allocated state (allocated ONCE) --------------------
+        const CAP = 8000;
+        const posX = new Float32Array(CAP), posY = new Float32Array(CAP);
+        const velX = new Float32Array(CAP), velY = new Float32Array(CAP);
+        const halfW = new Float32Array(CAP), halfH = new Float32Array(CAP);
+        const leaf = new Int32Array(CAP);              // bvh handle per entity (incremental mode)
+        const ids = new Int32Array(CAP);              // userData = entity index (bulk dataArray)
+        for (let i = 0; i < CAP; i++) ids[i] = i;
+        const packed = new Float32Array(CAP * 4);      // tight boxes, packed 4*N
+        const fatp = new Float32Array(CAP * 4);      // fattened boxes, packed 4*N
+        const outBuf = new Int32Array(CAP);            // query hit sink
+        const benchOut = new Int32Array(CAP);          // timing sink (keeps hit flags clean)
+        const hitFlag = new Uint8Array(CAP);           // 1 = entity is a current query hit
+        const tmp4 = new Float32Array(4);              // scratch box for updateLeaf / oracle
+        const qbox = new Float32Array(4);              // scratch query box
+        // The BVH: N leaves occupy exactly 2N-1 nodes, and bulk insertLeaves reserves
+        // 2N up front, so 2*CAP is the floor. The +512 is deliberate headroom -- it
+        // keeps capacity comfortably clear of that edge across every mode switch and
+        // slider slam, matching the library's own "size for headroom" guidance.
+        const bvh = new DynamicBVH2D(CAP * 2 + 512);
+
+        // ---- live parameters ----------------------------------------------------
+        let N = 1500;
+        let margin = 6;
+        let speedMul = 1;
+        let qmode = "point";        // point | box | ray
+        let phaseMode = "inc";      // inc | bulk
+        let showTree = false;
+        let doCompare = true;
+        let showGrid = true;
+        let paused = false;
+        let stepOnce = false;
+
+        const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        if (reduceMotion) speedMul = 0.35;
+
+        // ---- viewport / world ---------------------------------------------------
+        const canvas = document.getElementById("scene");
+        const ctx = canvas.getContext("2d", {alpha: false});
+        let worldW = 800, worldH = 500, dpr = 1;
+
+        function resize() {
+            const r = canvas.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) return;
+            dpr = Math.min(window.devicePixelRatio || 1, 2);
+            const oldW = worldW, oldH = worldH;
+            worldW = r.width;
+            worldH = r.height;
+            canvas.width = Math.round(worldW * dpr);
+            canvas.height = Math.round(worldH * dpr);
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            // Rescale positions into the new world so the field always fills the
+            // viewport -- this absorbs the boot-time jump when the canvas is first
+            // measured small and then grows once layout settles.
+            if (oldW > 2 && oldH > 2 && (oldW !== worldW || oldH !== worldH)) {
+                const sx = worldW / oldW, sy = worldH / oldH;
+                for (let i = 0; i < N; i++) {
+                    posX[i] *= sx;
+                    posY[i] *= sy;
+                    if (posX[i] < halfW[i]) posX[i] = halfW[i];
+                    else if (posX[i] > worldW - halfW[i]) posX[i] = worldW - halfW[i];
+                    if (posY[i] < halfH[i]) posY[i] = halfH[i];
+                    else if (posY[i] > worldH - halfH[i]) posY[i] = worldH - halfH[i];
+                }
+            }
+        }
+
+        const ro = new ResizeObserver(resize);
+        ro.observe(canvas);
+
+        // ---- deterministic-ish PRNG (so Reseed is reproducible within a session)
+        let seed = 0x9e3779b9;
+
+        function rnd() {
+            seed ^= seed << 13;
+            seed ^= seed >>> 17;
+            seed ^= seed << 5;
+            return ((seed >>> 0) / 4294967296);
+        }
+
+        function seedEntities() {
+            for (let i = 0; i < N; i++) {
+                halfW[i] = 2.5 + rnd() * 6;
+                halfH[i] = 2.5 + rnd() * 6;
+                posX[i] = halfW[i] + rnd() * Math.max(1, worldW - 2 * halfW[i]);
+                posY[i] = halfH[i] + rnd() * Math.max(1, worldH - 2 * halfH[i]);
+                const ang = rnd() * Math.PI * 2;
+                const sp = 22 + rnd() * 46;
+                velX[i] = Math.cos(ang) * sp;
+                velY[i] = Math.sin(ang) * sp;
+            }
+        }
+
+        function tightBoxInto(o, i) {
+            o[0] = posX[i] - halfW[i];
+            o[1] = posY[i] - halfH[i];
+            o[2] = posX[i] + halfW[i];
+            o[3] = posY[i] + halfH[i];
+        }
+
+        // Full rebuild that RECAPTURES per-entity leaf handles (needed for the
+        // incremental updateLeaf path). Uses single insertLeaf so each handle is known.
+        function rebuildIncremental() {
+            bvh.clear();
+            for (let i = 0; i < N; i++) {
+                tightBoxInto(tmp4, i);
+                // pre-fatten so the fast path has slack; matches how updateLeaf stores bounds
+                tmp4[0] -= margin;
+                tmp4[1] -= margin;
+                tmp4[2] += margin;
+                tmp4[3] += margin;
+                leaf[i] = bvh.insertLeaf(tmp4, i);
+            }
+        }
+
+        function reinit(reseed) {
+            if (reseed) seedEntities();
+            if (phaseMode === "inc") rebuildIncremental();
+            // bulk mode rebuilds from scratch every frame, so no persistent handles needed
+        }
+
+        // ---- simulation step ----------------------------------------------------
+        function integrate(dt) {
+            for (let i = 0; i < N; i++) {
+                let x = posX[i] + velX[i] * dt * speedMul;
+                let y = posY[i] + velY[i] * dt * speedMul;
+                const hw = halfW[i], hh = halfH[i];
+                if (x < hw) {
+                    x = hw;
+                    velX[i] = -velX[i];
+                } else if (x > worldW - hw) {
+                    x = worldW - hw;
+                    velX[i] = -velX[i];
+                }
+                if (y < hh) {
+                    y = hh;
+                    velY[i] = -velY[i];
+                } else if (y > worldH - hh) {
+                    y = worldH - hh;
+                    velY[i] = -velY[i];
+                }
+                posX[i] = x;
+                posY[i] = y;
+            }
+        }
+
+        // Refresh the broadphase index. Returns nothing; leaves bvh consistent.
+        function refreshBroadphase() {
+            if (phaseMode === "inc") {
+                for (let i = 0; i < N; i++) {
+                    tightBoxInto(tmp4, i);
+                    leaf[i] = bvh.updateLeaf(leaf[i], tmp4, margin);
+                }
+            } else {
+                // pack tight boxes -> fatten via aabb2 -> bulk-insert into a fresh tree.
+                for (let i = 0, j = 0; i < N; i++, j += 4) {
+                    packed[j] = posX[i] - halfW[i];
+                    packed[j + 1] = posY[i] - halfH[i];
+                    packed[j + 2] = posX[i] + halfW[i];
+                    packed[j + 3] = posY[i] + halfH[i];
+                }
+                aabb.fattenAll(fatp, packed, margin, N);
+                bvh.clear();
+                bvh.insertLeaves(fatp, ids, N);
+            }
+        }
+
+        // ---- query gizmo state --------------------------------------------------
+        let curX = 0, curY = 0, haveCursor = false;
+        let dragging = false, dragX0 = 0, dragY0 = 0;
+        const RETICLE = 46; // half-extent of the box reticle when not dragging
+
+        // Read entity i's stored fat bounds into o4, matching whatever the BVH holds,
+        // so the linear oracle probes EXACTLY the same geometry the BVH query does.
+        function storedBoundsInto(o4, i) {
+            if (phaseMode === "inc") {
+                bvh.getBounds(leaf[i], o4);
+            } else {
+                const j = i << 2;
+                o4[0] = fatp[j];
+                o4[1] = fatp[j + 1];
+                o4[2] = fatp[j + 2];
+                o4[3] = fatp[j + 3];
+            }
+        }
+
+        function buildQueryBox() {
+            if (qmode === "box") {
+                if (dragging) {
+                    qbox[0] = Math.min(dragX0, curX);
+                    qbox[1] = Math.min(dragY0, curY);
+                    qbox[2] = Math.max(dragX0, curX);
+                    qbox[3] = Math.max(dragY0, curY);
+                } else {
+                    qbox[0] = curX - RETICLE;
+                    qbox[1] = curY - RETICLE;
+                    qbox[2] = curX + RETICLE;
+                    qbox[3] = curY + RETICLE;
+                }
+            }
+        }
+
+        // Run the active probe through the BVH; write hits into hitFlag. Returns count.
+        function runBvhQuery() {
+            let count = 0;
+            if (qmode === "point") {
+                count = bvh.queryPoint(curX, curY, outBuf);
+            } else if (qmode === "box") {
+                count = bvh.query(qbox, outBuf);
+            } else {
+                count = bvh.raycast(worldW * 0.5, worldH * 0.5, curX, curY, outBuf);
+            }
+            for (let k = 0; k < count; k++) hitFlag[outBuf[k]] = 1;
+            return count;
+        }
+
+        // Linear-scan oracle over the SAME stored bounds. Returns match count only.
+        function runLinearQuery() {
+            let count = 0;
+            if (qmode === "point") {
+                for (let i = 0; i < N; i++) {
+                    storedBoundsInto(tmp4, i);
+                    if (curX >= tmp4[0] && curX <= tmp4[2] && curY >= tmp4[1] && curY <= tmp4[3]) count++;
+                }
+            } else if (qmode === "box") {
+                const b0 = qbox[0], b1 = qbox[1], b2 = qbox[2], b3 = qbox[3];
+                for (let i = 0; i < N; i++) {
+                    storedBoundsInto(tmp4, i);
+                    if (tmp4[0] <= b2 && tmp4[2] >= b0 && tmp4[1] <= b3 && tmp4[3] >= b1) count++;
+                }
+            } else {
+                const ox = worldW * 0.5, oy = worldH * 0.5;
+                const dx = curX - ox, dy = curY - oy;
+                const invDx = dx !== 0 ? 1 / dx : 0, invDy = dy !== 0 ? 1 / dy : 0;
+                for (let i = 0; i < N; i++) {
+                    storedBoundsInto(tmp4, i);
+                    let tmin = 0, tmax = 1, hit = true;
+                    if (dx !== 0) {
+                        let t1 = (tmp4[0] - ox) * invDx, t2 = (tmp4[2] - ox) * invDx;
+                        if (t1 > t2) {
+                            const t = t1;
+                            t1 = t2;
+                            t2 = t;
+                        }
+                        if (t1 > tmin) tmin = t1;
+                        if (t2 < tmax) tmax = t2;
+                        if (tmin > tmax) hit = false;
+                    } else if (ox < tmp4[0] || ox > tmp4[2]) hit = false;
+                    if (hit) {
+                        if (dy !== 0) {
+                            let t1 = (tmp4[1] - oy) * invDy, t2 = (tmp4[3] - oy) * invDy;
+                            if (t1 > t2) {
+                                const t = t1;
+                                t1 = t2;
+                                t2 = t;
+                            }
+                            if (t1 > tmin) tmin = t1;
+                            if (t2 < tmax) tmax = t2;
+                            if (tmin > tmax) hit = false;
+                        } else if (oy < tmp4[1] || oy > tmp4[3]) hit = false;
+                    }
+                    if (hit) count++;
+                }
+            }
+            return count;
+        }
+
+        // ---- rendering ----------------------------------------------------------
+        const drawStack = new Int32Array(600); // pre-allocated traversal stack for the overlay
+
+        function cssVar(name) {
+            return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+        }
+
+        let COL = {};
+
+        function refreshColors() {
+            COL.struct = cssVar("--struct");
+            COL.hit = cssVar("--hit");
+            COL.hitStrong = cssVar("--hit-strong");
+            COL.grid = cssVar("--viewport-grid");
+            COL.vp = cssVar("--viewport");
+        }
+
+        refreshColors();
+
+        function render(hitCount) {
+            ctx.fillStyle = COL.vp;
+            ctx.fillRect(0, 0, worldW, worldH);
+
+            if (showGrid) {
+                ctx.strokeStyle = COL.grid;
+                ctx.lineWidth = 1;
+                const gs = 64;
+                ctx.beginPath();
+                for (let x = gs; x < worldW; x += gs) {
+                    ctx.moveTo(x, 0);
+                    ctx.lineTo(x, worldH);
+                }
+                for (let y = gs; y < worldH; y += gs) {
+                    ctx.moveTo(0, y);
+                    ctx.lineTo(worldW, y);
+                }
+                ctx.stroke();
+            }
+
+            // BVH internal-node overlay (read-only walk of the public SoA fields).
+            if (showTree && bvh.root !== -1) {
+                let sp = 0;
+                drawStack[sp++] = bvh.root;
+                ctx.lineWidth = 1;
+                while (sp > 0) {
+                    const node = drawStack[--sp];
+                    const c = node << 1;
+                    const left = bvh.children[c];
+                    if (left === -1) continue; // leaf -> drawn as the entity itself
+                    const b = node << 2;
+                    const h = bvh.heights[node];
+                    const a = Math.max(0.06, 0.5 - h * 0.05);
+                    ctx.strokeStyle = "rgba(67,180,228," + a.toFixed(3) + ")";
+                    ctx.strokeRect(bvh.bboxes[b], bvh.bboxes[b + 1],
+                        bvh.bboxes[b + 2] - bvh.bboxes[b], bvh.bboxes[b + 3] - bvh.bboxes[b + 1]);
+                    if (sp + 2 <= drawStack.length) {
+                        drawStack[sp++] = left;
+                        drawStack[sp++] = bvh.children[c + 1];
+                    }
+                }
+            }
+
+            // entities: structure color for the field, amber fill for query hits.
+            ctx.fillStyle = "rgba(67,180,228,0.28)";
+            for (let i = 0; i < N; i++) {
+                if (hitFlag[i]) continue;
+                const w = halfW[i] * 2, h = halfH[i] * 2;
+                ctx.fillRect(posX[i] - halfW[i], posY[i] - halfH[i], w < 1.4 ? 1.4 : w, h < 1.4 ? 1.4 : h);
+            }
+            ctx.fillStyle = COL.hit;
+            for (let i = 0; i < N; i++) {
+                if (!hitFlag[i]) continue;
+                const w = halfW[i] * 2, h = halfH[i] * 2;
+                ctx.fillRect(posX[i] - halfW[i], posY[i] - halfH[i], w < 2 ? 2 : w, h < 2 ? 2 : h);
+            }
+
+            // query gizmo
+            ctx.strokeStyle = COL.hitStrong;
+            ctx.lineWidth = 1.5;
+            if (qmode === "point") {
+                ctx.beginPath();
+                ctx.moveTo(curX - 9, curY);
+                ctx.lineTo(curX + 9, curY);
+                ctx.moveTo(curX, curY - 9);
+                ctx.lineTo(curX, curY + 9);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.arc(curX, curY, 4, 0, Math.PI * 2);
+                ctx.stroke();
+            } else if (qmode === "box") {
+                ctx.fillStyle = "rgba(255,180,84,0.10)";
+                ctx.fillRect(qbox[0], qbox[1], qbox[2] - qbox[0], qbox[3] - qbox[1]);
+                ctx.setLineDash([5, 4]);
+                ctx.strokeRect(qbox[0], qbox[1], qbox[2] - qbox[0], qbox[3] - qbox[1]);
+                ctx.setLineDash([]);
+            } else {
+                const ox = worldW * 0.5, oy = worldH * 0.5;
+                ctx.beginPath();
+                ctx.moveTo(ox, oy);
+                ctx.lineTo(curX, curY);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.arc(ox, oy, 4, 0, Math.PI * 2);
+                ctx.fillStyle = COL.hitStrong;
+                ctx.fill();
+            }
+        }
+
+        // ---- sparkline ----------------------------------------------------------
+        const frameSpark = document.getElementById("frameSpark");
+        const sctx = frameSpark.getContext("2d");
+        const RING = 140;
+        const frameRing = new Float32Array(RING);
+        let ringHead = 0, ringLen = 0;
+        let sparkW = 260, sparkH = 46, sdpr = 1;
+
+        function resizeSpark() {
+            const r = frameSpark.getBoundingClientRect();
+            if (r.width < 2) return;
+            sdpr = Math.min(window.devicePixelRatio || 1, 2);
+            sparkW = r.width;
+            sparkH = r.height;
+            frameSpark.width = Math.round(sparkW * sdpr);
+            frameSpark.height = Math.round(sparkH * sdpr);
+            sctx.setTransform(sdpr, 0, 0, sdpr, 0, 0);
+        }
+
+        new ResizeObserver(resizeSpark).observe(frameSpark);
+
+        function drawSpark() {
+            sctx.clearRect(0, 0, sparkW, sparkH);
+            const maxMs = 33.4, budget = 16.7;
+            // budget line
+            const by = sparkH - (budget / maxMs) * sparkH;
+            sctx.strokeStyle = "rgba(120,140,170,0.30)";
+            sctx.setLineDash([3, 3]);
+            sctx.lineWidth = 1;
+            sctx.beginPath();
+            sctx.moveTo(0, by);
+            sctx.lineTo(sparkW, by);
+            sctx.stroke();
+            sctx.setLineDash([]);
+            if (ringLen < 2) return;
+            const n = ringLen;
+            const stepX = sparkW / (RING - 1);
+            // area
+            sctx.beginPath();
+            for (let k = 0; k < n; k++) {
+                const idx = (ringHead - n + k + RING * 2) % RING;
+                const v = Math.min(frameRing[idx], maxMs);
+                const x = k * stepX;
+                const y = sparkH - (v / maxMs) * sparkH;
+                if (k === 0) sctx.moveTo(x, y); else sctx.lineTo(x, y);
+            }
+            const grad = sctx.createLinearGradient(0, 0, 0, sparkH);
+            grad.addColorStop(0, "rgba(67,180,228,0.34)");
+            grad.addColorStop(1, "rgba(67,180,228,0.02)");
+            const lastX = (n - 1) * stepX;
+            sctx.lineTo(lastX, sparkH);
+            sctx.lineTo(0, sparkH);
+            sctx.closePath();
+            sctx.fillStyle = grad;
+            sctx.fill();
+            // line
+            sctx.beginPath();
+            for (let k = 0; k < n; k++) {
+                const idx = (ringHead - n + k + RING * 2) % RING;
+                const v = Math.min(frameRing[idx], maxMs);
+                const x = k * stepX;
+                const y = sparkH - (v / maxMs) * sparkH;
+                if (k === 0) sctx.moveTo(x, y); else sctx.lineTo(x, y);
+            }
+            sctx.strokeStyle = COL.struct;
+            sctx.lineWidth = 1.5;
+            sctx.stroke();
+            // endpoint
+            const lastIdx = (ringHead - 1 + RING) % RING;
+            const lv = Math.min(frameRing[lastIdx], maxMs);
+            const ly = sparkH - (lv / maxMs) * sparkH;
+            sctx.fillStyle = COL.struct;
+            sctx.beginPath();
+            sctx.arc(lastX, ly, 2.6, 0, Math.PI * 2);
+            sctx.fill();
+        }
+
+        // ---- HUD / telemetry text (throttled) -----------------------------------
+        const el = (id) => document.getElementById(id);
+        const tEnt = el("tEnt"), tNodes = el("tNodes"), tHeight = el("tHeight"),
+            tHits = el("tHits"), tFrame = el("tFrame"), tLeaves = el("tLeaves"),
+            hudHits = el("hudHits"), hudMode = el("hudMode"),
+            sparkVal = el("sparkVal"), allocPill = el("allocPill"), heapLine = el("heapLine"),
+            cmpBvh = el("cmpBvh"), cmpLin = el("cmpLin"), cmpSpeed = el("cmpSpeed"),
+            cmpMatch = el("cmpMatch"), cmpCard = el("cmpCard");
+
+        let emaFrame = 16, emaBvh = 0, emaLin = 0;
+        let lastHits = 0, lastBvhMatch = 0, lastLinMatch = 0;
+        const heapSupported = !!(performance && performance.memory);
+        let lastHeap = heapSupported ? performance.memory.usedJSHeapSize : 0;
+        let heapDeltaEma = 0;
+
+        function updateText() {
+            tEnt.textContent = N;
+            tNodes.textContent = bvh.nodeCount;
+            tHeight.textContent = bvh.height;
+            tLeaves.textContent = bvh.leafCount;
+            tHits.textContent = lastHits;
+            hudHits.textContent = lastHits;
+            hudMode.textContent = qmode + (qmode === "box" && dragging ? " (drag)" : "");
+            tFrame.innerHTML = emaFrame.toFixed(1) + '<small>ms</small>';
+            sparkVal.textContent = emaFrame.toFixed(1) + "ms";
+
+            if (doCompare) {
+                cmpCard.classList.remove("cmp-disabled");
+                cmpBvh.textContent = emaBvh > 0 ? emaBvh.toFixed(3) + " us" : "--";
+                cmpLin.textContent = emaLin > 0 ? emaLin.toFixed(3) + " us" : "--";
+                // Guard + cap: below the timer floor emaBvh can be ~0, which would
+                // print a nonsense ratio (1e+41x). Show a clean number, or a
+                // ">Nx" floor when the win is larger than we can honestly resolve.
+                if (emaBvh > 1e-4 && emaLin > 0) {
+                    const sp = emaLin / emaBvh;
+                    cmpSpeed.textContent = sp >= 9999 ? ">9999x"
+                        : sp >= 100 ? Math.round(sp) + "x"
+                            : sp.toFixed(1) + "x";
+                } else {
+                    cmpSpeed.textContent = "--";
+                }
+                const ok = lastBvhMatch === lastLinMatch;
+                cmpMatch.innerHTML = ok
+                    ? 'results match <b>' + lastBvhMatch + '</b>'
+                    : '<span style="color:var(--bad)">mismatch ' + lastBvhMatch + ' vs ' + lastLinMatch + '</span>';
+            } else {
+                cmpCard.classList.add("cmp-disabled");
+                cmpBvh.textContent = "--";
+                cmpLin.textContent = "--";
+                cmpSpeed.textContent = "off";
+                cmpMatch.textContent = "comparison off";
+            }
+
+            if (heapSupported) {
+                const flat = Math.abs(heapDeltaEma) < 4096;
+                allocPill.classList.toggle("warn", !flat);
+                allocPill.innerHTML = '<span style="width:7px;height:7px;border-radius:50%;background:currentColor"></span> '
+                    + (flat ? "0 B / frame" : (heapDeltaEma > 0 ? "+" : "") + (heapDeltaEma / 1024).toFixed(1) + " KB/f");
+                heapLine.textContent = "JS heap (Chrome): " + (performance.memory.usedJSHeapSize / 1048576).toFixed(1)
+                    + " MB, flat under steady load.";
+            }
+        }
+
+        // ---- pipeline strip state ----------------------------------------------
+        const psFat = el("ps-fat"), psIns = el("ps-ins"), psQry = el("ps-qry"), psMove = el("ps-move");
+        const psFatName = el("psFatName"), psFatOp = el("psFatOp"),
+            psInsName = el("psInsName"), psInsOp = el("psInsOp"), psQryName = el("psQryName"),
+            pipeModeTag = el("pipeModeTag");
+
+        function syncPipelineLabels() {
+            if (phaseMode === "inc") {
+                psFat.className = "pipe-stage lib-a";
+                psFatName.textContent = "fatten margin";
+                psFatOp.textContent = "per moved body";
+                psIns.className = "pipe-stage lib-b";
+                psInsName.textContent = "updateLeaf";
+                psInsOp.textContent = "O(1) fast path / refit";
+                pipeModeTag.textContent = "incremental";
+                pipeModeTag.className = "pipe-tag tag-a";
+            } else {
+                psFat.className = "pipe-stage lib-a";
+                psFatName.textContent = "fattenAll";
+                psFatOp.textContent = "packed 4*N, 1 call";
+                psIns.className = "pipe-stage lib-b";
+                psInsName.textContent = "insertLeaves";
+                psInsOp.textContent = "bulk, batch-atomic";
+                pipeModeTag.textContent = "bulk rebuild";
+                pipeModeTag.className = "pipe-tag tag-b";
+            }
+            psQryName.textContent = qmode === "point" ? "queryPoint" : qmode === "box" ? "query" : "raycast";
+            litPipeline();
+        }
+
+        function litPipeline() {
+            // all four stages run every frame; keep them lit (idempotent).
+            psMove.classList.add("active");
+            psFat.classList.add("active");
+            psIns.classList.add("active");
+            psQry.classList.add("active");
+        }
+
+        // ---- main loop ----------------------------------------------------------
+        let last = performance.now();
+        let textAccum = 0, frameCount = 0;
+
+        function frame(now) {
+            let dt = (now - last) / 1000;
+            last = now;
+            if (dt > 1 / 20) dt = 1 / 20; // clamp after a tab-away
+
+            const t0 = performance.now();
+
+            if (!paused || stepOnce) {
+                integrate(dt);
+                refreshBroadphase();
+                stepOnce = false;
+            }
+
+            // query every frame (interactive even while paused)
+            buildQueryBox();
+            hitFlag.fill(0, 0, N);
+            const hits = runBvhQuery();
+            lastHits = hits;
+
+            // Timing comparison, amortized over reps for stable sub-us numbers.
+            // The BVH probe is O(log n) and cheap, so it gets MANY reps -- enough
+            // to rise above a coarse performance.now() floor (else a 0-hit query
+            // reads 0.000us and the speedup ratio blows up). The linear scan is
+            // O(n) and costly, so it gets few reps, kept low at high entity counts.
+            if (doCompare) {
+                const KB = 512;
+                const KL = N > 4000 ? 6 : N > 1500 ? 12 : 24;
+                const b0 = performance.now();
+                for (let r = 0; r < KB; r++) {
+                    if (qmode === "point") bvh.queryPoint(curX, curY, benchOut);
+                    else if (qmode === "box") bvh.query(qbox, benchOut);
+                    else bvh.raycast(worldW * 0.5, worldH * 0.5, curX, curY, benchOut);
+                }
+                const b1 = performance.now();
+                let linCount = 0;
+                for (let r = 0; r < KL; r++) linCount = runLinearQuery();
+                const b2 = performance.now();
+                const bvhUs = ((b1 - b0) / KB) * 1000;
+                const linUs = ((b2 - b1) / KL) * 1000;
+                emaBvh = emaBvh ? emaBvh * 0.85 + bvhUs * 0.15 : bvhUs;
+                emaLin = emaLin ? emaLin * 0.85 + linUs * 0.15 : linUs;
+                lastBvhMatch = hits;
+                lastLinMatch = linCount;
+            }
+
+            render(hits);
+
+            const t1 = performance.now();
+            const frameMs = t1 - t0;
+            emaFrame = emaFrame * 0.9 + frameMs * 0.1;
+            frameRing[ringHead] = frameMs;
+            ringHead = (ringHead + 1) % RING;
+            if (ringLen < RING) ringLen++;
+
+            if (heapSupported) {
+                const h = performance.memory.usedJSHeapSize;
+                const d = h - lastHeap;
+                lastHeap = h;
+                // ignore the sawtooth drop of a GC sweep; track the per-frame growth
+                if (d >= 0) heapDeltaEma = heapDeltaEma * 0.9 + d * 0.1;
+            }
+
+            drawSpark();
+
+            frameCount++;
+            if (frameCount >= 6) {
+                updateText();
+                frameCount = 0;
+            }
+
+            requestAnimationFrame(frame);
+        }
+
+        // ---- input wiring -------------------------------------------------------
+        function toWorld(ev) {
+            const r = canvas.getBoundingClientRect();
+            curX = (ev.clientX - r.left);
+            curY = (ev.clientY - r.top);
+            curX = curX < 0 ? 0 : curX > worldW ? worldW : curX;
+            curY = curY < 0 ? 0 : curY > worldH ? worldH : curY;
+            haveCursor = true;
+        }
+
+        canvas.addEventListener("pointermove", toWorld);
+        canvas.addEventListener("pointerdown", (ev) => {
+            toWorld(ev);
+            dragging = true;
+            dragX0 = curX;
+            dragY0 = curY;
+            canvas.setPointerCapture(ev.pointerId);
+        });
+        canvas.addEventListener("pointerup", (ev) => {
+            dragging = false;
+            try {
+                canvas.releasePointerCapture(ev.pointerId);
+            } catch (e) {
+            }
+        });
+        canvas.addEventListener("pointerleave", () => {
+            dragging = false;
+        });
+
+        document.querySelectorAll('input[name="qmode"]').forEach((r) => {
+            r.addEventListener("change", (e) => {
+                qmode = e.target.value;
+                syncPipelineLabels();
+            });
+        });
+        document.querySelectorAll('input[name="phase"]').forEach((r) => {
+            r.addEventListener("change", (e) => {
+                phaseMode = e.target.value;
+                reinit(false);            // recapture handles when returning to incremental
+                syncPipelineLabels();
+                emaBvh = 0;
+                emaLin = 0;
+            });
+        });
+
+        el("sEnt").addEventListener("input", (e) => {
+            N = parseInt(e.target.value, 10);
+            el("rvEnt").textContent = N;
+            seedEntities();
+            reinit(false);
+            hitFlag.fill(0);
+        });
+        el("sMargin").addEventListener("input", (e) => {
+            margin = parseFloat(e.target.value);
+            el("rvMargin").textContent = margin.toFixed(1);
+            if (phaseMode === "inc") reinit(false); // re-store bounds at the new margin
+        });
+        el("sSpeed").addEventListener("input", (e) => {
+            speedMul = parseFloat(e.target.value);
+            el("rvSpeed").textContent = speedMul.toFixed(2) + "x";
+        });
+
+        el("tgTree").addEventListener("change", (e) => {
+            showTree = e.target.checked;
+        });
+        el("tgCmp").addEventListener("change", (e) => {
+            doCompare = e.target.checked;
+            if (!doCompare) {
+                emaBvh = 0;
+                emaLin = 0;
+            }
+        });
+        el("tgGrid").addEventListener("change", (e) => {
+            showGrid = e.target.checked;
+        });
+
+        const btnPause = el("btnPause");
+        btnPause.addEventListener("click", () => {
+            paused = !paused;
+            btnPause.textContent = paused ? "Resume" : "Pause";
+            btnPause.dataset.paused = String(paused);
+        });
+        el("btnStep").addEventListener("click", () => {
+            if (paused) stepOnce = true;
+        });
+        el("btnReseed").addEventListener("click", () => {
+            seed = (seed * 1664525 + 1013904223) >>> 0;
+            seedEntities();
+            reinit(false);
+            hitFlag.fill(0);
+        });
+
+        document.addEventListener("keydown", (e) => {
+            if (e.target.tagName === "INPUT" || e.target.tagName === "BUTTON") return;
+            if (e.code === "Space") {
+                e.preventDefault();
+                btnPause.click();
+            }
+        });
+
+        // theme toggle (cooperates with the Artifact host's own toggle: both set data-theme)
+        el("themeBtn").addEventListener("click", () => {
+            const root = document.documentElement;
+            const cur = root.getAttribute("data-theme")
+                || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+            root.setAttribute("data-theme", cur === "dark" ? "light" : "dark");
+            setTimeout(refreshColors, 0);
+        });
+        const mq = window.matchMedia("(prefers-color-scheme: dark)");
+        mq.addEventListener && mq.addEventListener("change", () => setTimeout(refreshColors, 0));
+
+        // ---- boot ---------------------------------------------------------------
+        resize();
+        resizeSpark();
+        if (worldW < 2) {
+            worldW = 800;
+            worldH = 500;
+        }
+        curX = worldW * 0.5;
+        curY = worldH * 0.42;
+        seedEntities();
+        reinit(false);
+        syncPipelineLabels();
+        updateText();
+        requestAnimationFrame(frame);
+    })();
+</script>
+
+</body>
+</html>
